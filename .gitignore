@@ -1,1 +1,37 @@
+# Codex
 .codex
+
+# Node / Vite / Svelte
+node_modules/
+dist/
+build/
+.svelte-kit/
+.vite/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.log
+
+# Tauri / Rust
+target/
+src-tauri/target/
+src-tauri/gen/
+src-tauri/.cargo/
+
+# Environment / local machine state
+.env
+.env.*
+!.env.example
+*.local
+tmp/
+temp/
+
+# Editor / OS noise
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+.DS_Store
+Thumbs.db
