@@ -11,13 +11,13 @@
     terminal: boolean;
   };
 
-  const RESULT_LIMIT = 8;
-
   let query = $state("");
   let isExpanded = $state(false);
   let results = $state<AppSearchResult[]>([]);
   let selectedIndex = $state(-1);
   let searchError = $state<string | null>(null);
+  let launchError = $state<string | null>(null);
+  let isLaunching = $state(false);
   let searchInput: HTMLInputElement;
   let searchRequestId = 0;
   let requestedExpandedState: boolean | null = null;
@@ -38,6 +38,7 @@
       results = [];
       selectedIndex = -1;
       searchError = null;
+      launchError = null;
       isExpanded = false;
 
       if (isTauri()) {
@@ -53,6 +54,7 @@
       results = [];
       selectedIndex = -1;
       searchError = null;
+      launchError = null;
       return;
     }
 
@@ -61,7 +63,7 @@
 
       const nextResults = await invoke<AppSearchResult[]>("search_apps", {
         query: trimmedQuery,
-        limit: RESULT_LIMIT,
+        limit: 0,
       });
 
       if (requestId !== searchRequestId || query.trim().length === 0) {
@@ -71,6 +73,7 @@
       results = nextResults;
       selectedIndex = nextResults.length > 0 ? 0 : -1;
       searchError = null;
+      launchError = null;
     } catch (error) {
       if (requestId !== searchRequestId) {
         return;
@@ -80,6 +83,7 @@
       results = [];
       selectedIndex = -1;
       searchError = "Search unavailable";
+      launchError = null;
     }
   }
 
@@ -123,6 +127,51 @@
     return title.trim().charAt(0).toUpperCase() || "?";
   }
 
+  function moveSelection(delta: number) {
+    if (results.length === 0) {
+      selectedIndex = -1;
+      return;
+    }
+
+    const nextIndex = selectedIndex < 0 ? 0 : selectedIndex + delta;
+    selectedIndex = ((nextIndex % results.length) + results.length) % results.length;
+  }
+
+  function selectedResult() {
+    if (selectedIndex < 0 || selectedIndex >= results.length) {
+      return null;
+    }
+
+    return results[selectedIndex];
+  }
+
+  async function launchSelectedResult() {
+    const selected = selectedResult();
+
+    if (!selected || isLaunching || !isTauri()) {
+      return;
+    }
+
+    isLaunching = true;
+    launchError = null;
+
+    try {
+      await invoke("launch_app", { appId: selected.app_id });
+      query = "";
+      results = [];
+      selectedIndex = -1;
+      searchError = null;
+      launchError = null;
+      isExpanded = false;
+    } catch (error) {
+      console.error("failed to launch app", error);
+      launchError = "Could not launch app";
+      focusSearchInput();
+    } finally {
+      isLaunching = false;
+    }
+  }
+
   onMount(() => {
     focusSearchInput();
 
@@ -156,6 +205,7 @@
     if (event.key === "Escape") {
       event.preventDefault();
       query = "";
+      launchError = null;
 
       if (isTauri()) {
         void invoke("close_launcher").catch((error) => {
@@ -165,6 +215,33 @@
       }
 
       searchInput?.blur();
+      return;
+    }
+
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      launchError = null;
+      moveSelection(1);
+      return;
+    }
+
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      launchError = null;
+      moveSelection(-1);
+      return;
+    }
+
+    if (event.key === "Tab") {
+      event.preventDefault();
+      launchError = null;
+      moveSelection(event.shiftKey ? -1 : 1);
+      return;
+    }
+
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void launchSelectedResult();
     }
   }
 </script>
@@ -209,6 +286,10 @@
       </ul>
     {:else if isExpanded && query.trim().length > 0}
       <div class="empty-state">{searchError ?? "No results"}</div>
+    {/if}
+
+    {#if isExpanded && launchError}
+      <div class="status-message" role="status">{launchError}</div>
     {/if}
   </section>
 </main>
@@ -284,6 +365,7 @@
   }
 
   .command-palette {
+    position: relative;
     width: 100%;
     height: 100%;
     max-width: 100%;
@@ -302,20 +384,21 @@
       inset 0 1px 0 rgba(255, 255, 255, 0.7);
     -ms-overflow-style: none;
     overscroll-behavior: none;
-    backdrop-filter: blur(28px) saturate(1.45);
-    -webkit-backdrop-filter: blur(28px) saturate(1.45);
+    backdrop-filter: blur(18px) saturate(1.35);
+    -webkit-backdrop-filter: blur(18px) saturate(1.35);
   }
 
   .command-palette.expanded {
-    grid-template-rows: 68px minmax(0, 1fr);
+    grid-template-rows: 60px minmax(0, 1fr);
     gap: 6px;
   }
 
   .spotlight-bar {
     width: 100%;
-    height: 100%;
+    height: 60px;
     max-width: 100%;
-    max-height: 100%;
+    min-height: 60px;
+    max-height: 60px;
     box-sizing: border-box;
     display: flex;
     align-items: center;
@@ -329,22 +412,22 @@
   }
 
   .search-icon {
-    width: 25px;
-    height: 25px;
+    width: 22px;
+    height: 22px;
     position: relative;
     flex: 0 0 auto;
     box-sizing: border-box;
-    border: 2.6px solid rgba(58, 60, 67, 0.46);
+    border: 2.2px solid rgba(58, 60, 67, 0.46);
     border-radius: 50%;
   }
 
   .search-icon::after {
     content: "";
     position: absolute;
-    width: 10px;
-    height: 2.6px;
-    right: -7px;
-    bottom: 0;
+    width: 9px;
+    height: 2.2px;
+    right: -6px;
+    bottom: 1px;
     border-radius: 999px;
     background: rgba(58, 60, 67, 0.46);
     transform: rotate(45deg);
@@ -354,9 +437,9 @@
   .search-input {
     min-width: 0;
     width: 100%;
-    height: 100%;
+    height: 60px;
     max-width: 100%;
-    max-height: 100%;
+    max-height: 60px;
     border: 0;
     outline: 0;
     padding: 0;
@@ -365,7 +448,7 @@
     color: rgba(18, 18, 20, 0.94);
     background: transparent;
     font: inherit;
-    font-size: 28px;
+    font-size: 24px;
     font-weight: 400;
     line-height: 1;
     caret-color: rgba(12, 113, 238, 0.95);
@@ -408,7 +491,7 @@
   }
 
   .result-row.selected {
-    background: rgba(12, 113, 238, 0.14);
+    background: rgba(12, 113, 238, 0.12);
   }
 
   .app-icon {
@@ -467,6 +550,23 @@
     font-size: 14px;
   }
 
+  .status-message {
+    position: absolute;
+    right: 16px;
+    bottom: 14px;
+    max-width: calc(100% - 32px);
+    padding: 6px 10px;
+    overflow: hidden;
+    border-radius: 9px;
+    background: rgba(18, 18, 20, 0.78);
+    color: rgba(255, 255, 255, 0.92);
+    font-size: 12px;
+    font-weight: 500;
+    line-height: 1.2;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   .search-input::-webkit-search-decoration,
   .search-input::-webkit-search-cancel-button,
   .search-input::-webkit-search-results-button,
@@ -515,7 +615,7 @@
     }
 
     .result-row.selected {
-      background: rgba(82, 155, 255, 0.24);
+      background: rgba(82, 155, 255, 0.2);
     }
 
     .app-icon {
@@ -526,6 +626,11 @@
     .result-subtitle,
     .empty-state {
       color: rgba(246, 247, 249, 0.56);
+    }
+
+    .status-message {
+      background: rgba(246, 247, 249, 0.88);
+      color: rgba(18, 18, 20, 0.9);
     }
   }
 </style>

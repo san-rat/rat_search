@@ -5,6 +5,7 @@ use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Size, We
 mod app_discovery;
 mod app_launch;
 mod app_search;
+mod settings;
 
 use app_discovery::AppCatalog;
 use app_launch::LaunchResult;
@@ -16,9 +17,6 @@ const TOGGLE_ARG: &str = "toggle";
 const DELAYED_CENTER_MS: u64 = 80;
 const LAUNCHER_VERTICAL_PERCENT: u32 = 25;
 const LAUNCHER_SEARCH_ROW_CENTER_OFFSET: i32 = 42;
-const LAUNCHER_WIDTH: u32 = 704;
-const LAUNCHER_COMPACT_HEIGHT: u32 = 76;
-const LAUNCHER_EXPANDED_HEIGHT: u32 = 460;
 
 #[cfg(debug_assertions)]
 fn dev_log(message: impl AsRef<str>) {
@@ -108,13 +106,13 @@ fn position_launcher(window: &WebviewWindow) -> tauri::Result<()> {
 
 fn set_launcher_size(window: &WebviewWindow, expanded: bool) -> tauri::Result<()> {
     let height = if expanded {
-        LAUNCHER_EXPANDED_HEIGHT
+        settings::LAUNCHER_EXPANDED_HEIGHT
     } else {
-        LAUNCHER_COMPACT_HEIGHT
+        settings::LAUNCHER_COMPACT_HEIGHT
     };
 
     window.set_size(Size::Physical(PhysicalSize {
-        width: LAUNCHER_WIDTH,
+        width: settings::LAUNCHER_WINDOW_WIDTH,
         height,
     }))?;
     position_launcher_with_reason(window, if expanded { "expand" } else { "collapse" })
@@ -206,9 +204,7 @@ fn is_wayland_session() -> bool {
 
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn register_launcher_shortcut(app: &tauri::App) {
-    use tauri_plugin_global_shortcut::{
-        Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState,
-    };
+    use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
     if cfg!(target_os = "linux") && is_wayland_session() {
         eprintln!(
@@ -217,7 +213,10 @@ fn register_launcher_shortcut(app: &tauri::App) {
         return;
     }
 
-    let launcher_shortcut = Shortcut::new(Some(Modifiers::ALT), Code::Space);
+    let launcher_shortcut = Shortcut::new(
+        Some(settings::DEFAULT_HOTKEY_MODIFIERS),
+        settings::DEFAULT_HOTKEY_CODE,
+    );
     let handler_shortcut = launcher_shortcut.clone();
     let plugin = tauri_plugin_global_shortcut::Builder::new()
         .with_handler(move |app, shortcut, event| {
@@ -233,7 +232,10 @@ fn register_launcher_shortcut(app: &tauri::App) {
     }
 
     if let Err(error) = app.global_shortcut().register(launcher_shortcut) {
-        eprintln!("failed to register Alt+Space launcher shortcut: {error}");
+        eprintln!(
+            "failed to register {} launcher shortcut: {error}",
+            settings::DEFAULT_HOTKEY_LABEL
+        );
     }
 }
 
@@ -306,6 +308,17 @@ pub fn run() {
         .setup(|app| {
             let launch_args = std::env::args().collect::<Vec<_>>();
             let app_catalog = AppCatalog::scan();
+            dev_log(format!(
+                "defaults: hotkey={}, max_results={}, compact_window={}x{}, expanded_window={}x{}, theme={}, search_source={}",
+                settings::DEFAULT_HOTKEY_LABEL,
+                settings::DEFAULT_MAX_RESULTS,
+                settings::LAUNCHER_WINDOW_WIDTH,
+                settings::LAUNCHER_COMPACT_HEIGHT,
+                settings::LAUNCHER_WINDOW_WIDTH,
+                settings::LAUNCHER_EXPANDED_HEIGHT,
+                settings::DEFAULT_THEME,
+                settings::DEFAULT_SEARCH_SOURCE
+            ));
             dev_log(format!("discovered {} applications", app_catalog.len()));
             app.manage(app_catalog);
 

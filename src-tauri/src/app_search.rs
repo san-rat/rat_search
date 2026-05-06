@@ -1,9 +1,10 @@
 use serde::Serialize;
 
-use crate::app_discovery::{AppCatalog, AppRecord};
+use crate::{
+    app_discovery::{AppCatalog, AppRecord},
+    settings,
+};
 
-const DEFAULT_RESULT_LIMIT: usize = 8;
-const MAX_RESULT_LIMIT: usize = 20;
 const EXACT_NAME_SCORE: i32 = 1000;
 const NAME_PREFIX_SCORE: i32 = 900;
 const KEYWORD_CATEGORY_EXACT_SCORE: i32 = 760;
@@ -61,8 +62,8 @@ pub(crate) fn search_apps(catalog: &AppCatalog, query: &str, limit: usize) -> Ve
 
 fn normalize_limit(limit: usize) -> usize {
     match limit {
-        0 => DEFAULT_RESULT_LIMIT,
-        limit => limit.min(MAX_RESULT_LIMIT),
+        0 => settings::DEFAULT_MAX_RESULTS,
+        limit => limit.min(settings::RESULT_LIMIT_CAP),
     }
 }
 
