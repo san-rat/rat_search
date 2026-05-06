@@ -1,6 +1,6 @@
 use std::{thread, time::Duration};
 
-use tauri::{Emitter, Manager, PhysicalPosition, Position, WebviewWindow};
+use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Size, WebviewWindow};
 
 mod app_discovery;
 mod app_launch;
@@ -16,6 +16,9 @@ const TOGGLE_ARG: &str = "toggle";
 const DELAYED_CENTER_MS: u64 = 80;
 const LAUNCHER_VERTICAL_PERCENT: u32 = 25;
 const LAUNCHER_SEARCH_ROW_CENTER_OFFSET: i32 = 42;
+const LAUNCHER_WIDTH: u32 = 704;
+const LAUNCHER_COMPACT_HEIGHT: u32 = 76;
+const LAUNCHER_EXPANDED_HEIGHT: u32 = 460;
 
 #[cfg(debug_assertions)]
 fn dev_log(message: impl AsRef<str>) {
@@ -103,6 +106,20 @@ fn position_launcher(window: &WebviewWindow) -> tauri::Result<()> {
     position_launcher_with_reason(window, "position")
 }
 
+fn set_launcher_size(window: &WebviewWindow, expanded: bool) -> tauri::Result<()> {
+    let height = if expanded {
+        LAUNCHER_EXPANDED_HEIGHT
+    } else {
+        LAUNCHER_COMPACT_HEIGHT
+    };
+
+    window.set_size(Size::Physical(PhysicalSize {
+        width: LAUNCHER_WIDTH,
+        height,
+    }))?;
+    position_launcher_with_reason(window, if expanded { "expand" } else { "collapse" })
+}
+
 fn focus_launcher(window: &WebviewWindow) {
     if let Err(error) = window.set_focus() {
         eprintln!("failed to focus launcher window: {error}");
@@ -114,6 +131,7 @@ fn focus_launcher(window: &WebviewWindow) {
 }
 
 fn show_launcher(window: &WebviewWindow) -> tauri::Result<()> {
+    set_launcher_size(window, false)?;
     position_launcher_with_reason(window, "before show")?;
     window.show()?;
     position_launcher_with_reason(window, "after show")?;
@@ -239,6 +257,18 @@ fn search_apps(
 }
 
 #[tauri::command]
+fn set_launcher_expanded(app: tauri::AppHandle, expanded: bool) -> Result<(), String> {
+    let Some(window) = app.get_webview_window(LAUNCHER_WINDOW_LABEL) else {
+        return Ok(());
+    };
+
+    set_launcher_size(&window, expanded).map_err(|error| {
+        eprintln!("failed to set launcher expanded={expanded}: {error}");
+        error.to_string()
+    })
+}
+
+#[tauri::command]
 fn launch_app(
     app: tauri::AppHandle,
     catalog: tauri::State<'_, AppCatalog>,
@@ -270,7 +300,8 @@ pub fn run() {
             close_launcher,
             hide_launcher,
             launch_app,
-            search_apps
+            search_apps,
+            set_launcher_expanded
         ])
         .setup(|app| {
             let launch_args = std::env::args().collect::<Vec<_>>();

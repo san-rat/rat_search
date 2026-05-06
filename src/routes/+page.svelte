@@ -14,11 +14,13 @@
   const RESULT_LIMIT = 8;
 
   let query = $state("");
+  let isExpanded = $state(false);
   let results = $state<AppSearchResult[]>([]);
   let selectedIndex = $state(-1);
   let searchError = $state<string | null>(null);
   let searchInput: HTMLInputElement;
   let searchRequestId = 0;
+  let requestedExpandedState: boolean | null = null;
 
   $effect(() => {
     void loadResults(query);
@@ -30,6 +32,22 @@
 
   async function loadResults(searchQuery: string) {
     const requestId = ++searchRequestId;
+    const trimmedQuery = searchQuery.trim();
+
+    if (trimmedQuery.length === 0) {
+      results = [];
+      selectedIndex = -1;
+      searchError = null;
+      isExpanded = false;
+
+      if (isTauri()) {
+        void setNativeExpanded(false);
+      }
+
+      return;
+    }
+
+    isExpanded = true;
 
     if (!isTauri()) {
       results = [];
@@ -39,12 +57,14 @@
     }
 
     try {
+      await setNativeExpanded(true);
+
       const nextResults = await invoke<AppSearchResult[]>("search_apps", {
-        query: searchQuery,
+        query: trimmedQuery,
         limit: RESULT_LIMIT,
       });
 
-      if (requestId !== searchRequestId) {
+      if (requestId !== searchRequestId || query.trim().length === 0) {
         return;
       }
 
@@ -60,6 +80,20 @@
       results = [];
       selectedIndex = -1;
       searchError = "Search unavailable";
+    }
+  }
+
+  async function setNativeExpanded(expanded: boolean) {
+    if (requestedExpandedState === expanded) {
+      return;
+    }
+
+    requestedExpandedState = expanded;
+
+    try {
+      await invoke("set_launcher_expanded", { expanded });
+    } catch (error) {
+      console.error("failed to resize launcher", error);
     }
   }
 
@@ -136,7 +170,7 @@
 </script>
 
 <main class="launcher-shell">
-  <section class="command-palette" aria-label="Rat Search">
+  <section class:expanded={isExpanded} class="command-palette" aria-label="Rat Search">
     <div class="spotlight-bar">
       <span class="search-icon" aria-hidden="true"></span>
       <input
@@ -152,7 +186,7 @@
       />
     </div>
 
-    {#if results.length > 0}
+    {#if isExpanded && results.length > 0}
       <ul class="results-list" aria-label="Search results">
         {#each results as result, index (result.app_id)}
           {@const imageSrc = iconImageSrc(result.icon)}
@@ -173,7 +207,7 @@
           </li>
         {/each}
       </ul>
-    {:else if query.trim().length > 0}
+    {:else if isExpanded && query.trim().length > 0}
       <div class="empty-state">{searchError ?? "No results"}</div>
     {/if}
   </section>
@@ -255,8 +289,8 @@
     max-width: 100%;
     max-height: 100%;
     display: grid;
-    grid-template-rows: 68px minmax(0, 1fr);
-    gap: 6px;
+    grid-template-rows: minmax(0, 1fr);
+    gap: 0;
     padding: 4px;
     overflow: hidden !important;
     border: 1px solid rgba(255, 255, 255, 0.64);
@@ -270,6 +304,11 @@
     overscroll-behavior: none;
     backdrop-filter: blur(28px) saturate(1.45);
     -webkit-backdrop-filter: blur(28px) saturate(1.45);
+  }
+
+  .command-palette.expanded {
+    grid-template-rows: 68px minmax(0, 1fr);
+    gap: 6px;
   }
 
   .spotlight-bar {
