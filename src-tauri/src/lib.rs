@@ -3,8 +3,10 @@ use std::{thread, time::Duration};
 use tauri::{Emitter, Manager, PhysicalPosition, Position, WebviewWindow};
 
 mod app_discovery;
+mod app_launch;
 
 use app_discovery::AppCatalog;
+use app_launch::LaunchResult;
 
 const LAUNCHER_WINDOW_LABEL: &str = "main";
 const LAUNCHER_SHOWN_EVENT: &str = "launcher:shown";
@@ -208,6 +210,21 @@ fn close_launcher(app: tauri::AppHandle) -> Result<(), String> {
     hide_launcher(&window).map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+fn launch_app(
+    app: tauri::AppHandle,
+    catalog: tauri::State<'_, AppCatalog>,
+    app_id: String,
+) -> Result<LaunchResult, String> {
+    let result = app_launch::launch_app(&catalog, &app_id)?;
+
+    if let Some(window) = app.get_webview_window(LAUNCHER_WINDOW_LABEL) {
+        hide_launcher(&window).map_err(|error| error.to_string())?;
+    }
+
+    Ok(result)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     initialize_linux_window_backend();
@@ -223,7 +240,7 @@ pub fn run() {
 
     builder
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![close_launcher])
+        .invoke_handler(tauri::generate_handler![close_launcher, launch_app])
         .setup(|app| {
             let launch_args = std::env::args().collect::<Vec<_>>();
             let app_catalog = AppCatalog::scan();

@@ -47,6 +47,10 @@ impl AppCatalog {
     pub(crate) fn len(&self) -> usize {
         self.apps.len()
     }
+
+    pub(crate) fn find_by_id(&self, id: &str) -> Option<&AppRecord> {
+        self.apps.iter().find(|app| app.id == id)
+    }
 }
 
 fn application_directories() -> Vec<PathBuf> {
