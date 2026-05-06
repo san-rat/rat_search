@@ -4,9 +4,11 @@ use tauri::{Emitter, Manager, PhysicalPosition, Position, WebviewWindow};
 
 mod app_discovery;
 mod app_launch;
+mod app_search;
 
 use app_discovery::AppCatalog;
 use app_launch::LaunchResult;
+use app_search::AppSearchResult;
 
 const LAUNCHER_WINDOW_LABEL: &str = "main";
 const LAUNCHER_SHOWN_EVENT: &str = "launcher:shown";
@@ -127,8 +129,16 @@ fn show_launcher(window: &WebviewWindow) -> tauri::Result<()> {
     Ok(())
 }
 
-fn hide_launcher(window: &WebviewWindow) -> tauri::Result<()> {
+fn hide_launcher_window(window: &WebviewWindow) -> tauri::Result<()> {
     window.hide()
+}
+
+fn hide_launcher_for_app(app: &tauri::AppHandle) -> Result<(), String> {
+    let Some(window) = app.get_webview_window(LAUNCHER_WINDOW_LABEL) else {
+        return Ok(());
+    };
+
+    hide_launcher_window(&window).map_err(|error| error.to_string())
 }
 
 fn toggle_launcher(app: &tauri::AppHandle) {
@@ -139,7 +149,7 @@ fn toggle_launcher(app: &tauri::AppHandle) {
 
     match window.is_visible() {
         Ok(true) => {
-            if let Err(error) = hide_launcher(&window) {
+            if let Err(error) = hide_launcher_window(&window) {
                 eprintln!("failed to hide launcher window: {error}");
             }
         }
@@ -203,11 +213,21 @@ fn register_launcher_shortcut(app: &tauri::App) {
 
 #[tauri::command]
 fn close_launcher(app: tauri::AppHandle) -> Result<(), String> {
-    let Some(window) = app.get_webview_window(LAUNCHER_WINDOW_LABEL) else {
-        return Ok(());
-    };
+    hide_launcher_for_app(&app)
+}
 
-    hide_launcher(&window).map_err(|error| error.to_string())
+#[tauri::command]
+fn hide_launcher(app: tauri::AppHandle) -> Result<(), String> {
+    hide_launcher_for_app(&app)
+}
+
+#[tauri::command]
+fn search_apps(
+    catalog: tauri::State<'_, AppCatalog>,
+    query: String,
+    limit: usize,
+) -> Vec<AppSearchResult> {
+    app_search::search_apps(&catalog, &query, limit)
 }
 
 #[tauri::command]
@@ -218,9 +238,7 @@ fn launch_app(
 ) -> Result<LaunchResult, String> {
     let result = app_launch::launch_app(&catalog, &app_id)?;
 
-    if let Some(window) = app.get_webview_window(LAUNCHER_WINDOW_LABEL) {
-        hide_launcher(&window).map_err(|error| error.to_string())?;
-    }
+    hide_launcher_for_app(&app)?;
 
     Ok(result)
 }
@@ -240,7 +258,12 @@ pub fn run() {
 
     builder
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![close_launcher, launch_app])
+        .invoke_handler(tauri::generate_handler![
+            close_launcher,
+            hide_launcher,
+            launch_app,
+            search_apps
+        ])
         .setup(|app| {
             let launch_args = std::env::args().collect::<Vec<_>>();
             let app_catalog = AppCatalog::scan();
