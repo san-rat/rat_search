@@ -15,6 +15,7 @@ const LAUNCHER_SHOWN_EVENT: &str = "launcher:shown";
 const TOGGLE_ARG: &str = "toggle";
 const DELAYED_CENTER_MS: u64 = 80;
 const LAUNCHER_VERTICAL_PERCENT: u32 = 25;
+const LAUNCHER_SEARCH_ROW_CENTER_OFFSET: i32 = 42;
 
 #[cfg(debug_assertions)]
 fn dev_log(message: impl AsRef<str>) {
@@ -67,17 +68,24 @@ fn position_launcher_with_reason(window: &WebviewWindow, reason: &str) -> tauri:
             .height
             .saturating_mul(LAUNCHER_VERTICAL_PERCENT)
             / 100) as i32;
-        let y = (monitor_position.y + vertical_target - (window_size.height / 2) as i32)
-            .max(monitor_position.y);
+        let max_y = monitor_position.y
+            + monitor_size
+                .height
+                .saturating_sub(window_size.height)
+                .try_into()
+                .unwrap_or(i32::MAX);
+        let desired_y = monitor_position.y + vertical_target - LAUNCHER_SEARCH_ROW_CENTER_OFFSET;
+        let y = desired_y.clamp(monitor_position.y, max_y.max(monitor_position.y));
 
         dev_log(format!(
-            "{reason}: monitor=({}, {}) {}x{}, window={}x{}, vertical_target={LAUNCHER_VERTICAL_PERCENT}%, target=({}, {})",
+            "{reason}: monitor=({}, {}) {}x{}, window={}x{}, vertical_target={LAUNCHER_VERTICAL_PERCENT}%, search_row_offset={}, target=({}, {})",
             monitor_position.x,
             monitor_position.y,
             monitor_size.width,
             monitor_size.height,
             window_size.width,
             window_size.height,
+            LAUNCHER_SEARCH_ROW_CENTER_OFFSET,
             x,
             y
         ));
