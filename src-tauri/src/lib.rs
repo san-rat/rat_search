@@ -2,6 +2,10 @@ use std::{thread, time::Duration};
 
 use tauri::{Emitter, Manager, PhysicalPosition, Position, WebviewWindow};
 
+mod app_discovery;
+
+use app_discovery::AppCatalog;
+
 const LAUNCHER_WINDOW_LABEL: &str = "main";
 const LAUNCHER_SHOWN_EVENT: &str = "launcher:shown";
 const TOGGLE_ARG: &str = "toggle";
@@ -222,6 +226,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![close_launcher])
         .setup(|app| {
             let launch_args = std::env::args().collect::<Vec<_>>();
+            let app_catalog = AppCatalog::scan();
+            dev_log(format!("discovered {} applications", app_catalog.len()));
+            app.manage(app_catalog);
 
             if let Some(window) = app.get_webview_window(LAUNCHER_WINDOW_LABEL) {
                 position_launcher(&window)?;
