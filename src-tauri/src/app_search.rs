@@ -4,6 +4,14 @@ use crate::app_discovery::{AppCatalog, AppRecord};
 
 const DEFAULT_RESULT_LIMIT: usize = 8;
 const MAX_RESULT_LIMIT: usize = 20;
+const EXACT_NAME_SCORE: i32 = 1000;
+const NAME_PREFIX_SCORE: i32 = 900;
+const KEYWORD_CATEGORY_EXACT_SCORE: i32 = 760;
+const NAME_CONTAINS_SCORE: i32 = 650;
+const DESCRIPTION_CONTAINS_SCORE: i32 = 480;
+const ABBREVIATION_SCORE: i32 = 420;
+const SUBSEQUENCE_SCORE: i32 = 260;
+const SHORT_NAME_BONUS_LIMIT: i32 = 50;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct AppSearchResult {
@@ -15,26 +23,39 @@ pub(crate) struct AppSearchResult {
 }
 
 pub(crate) fn search_apps(catalog: &AppCatalog, query: &str, limit: usize) -> Vec<AppSearchResult> {
-    let query = query.trim().to_lowercase();
+    let query = normalize(query);
     let limit = normalize_limit(limit);
+
+    if query.is_empty() {
+        let mut apps = catalog.apps.iter().collect::<Vec<_>>();
+        apps.sort_by(compare_apps_alphabetically);
+
+        return apps
+            .into_iter()
+            .take(limit)
+            .map(AppSearchResult::from)
+            .collect();
+    }
 
     let mut matches = catalog
         .apps
         .iter()
-        .filter(|app| query.is_empty() || app_matches_query(app, &query))
+        .filter_map(|app| {
+            let score = score_app(app, &query);
+            (score > 0).then_some((app, score))
+        })
         .collect::<Vec<_>>();
 
-    matches.sort_by(|left, right| {
-        left.name
-            .to_lowercase()
-            .cmp(&right.name.to_lowercase())
-            .then_with(|| left.id.cmp(&right.id))
+    matches.sort_by(|(left_app, left_score), (right_app, right_score)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| compare_apps_alphabetically(left_app, right_app))
     });
 
     matches
         .into_iter()
         .take(limit)
-        .map(AppSearchResult::from)
+        .map(|(app, _score)| AppSearchResult::from(app))
         .collect()
 }
 
@@ -45,28 +66,108 @@ fn normalize_limit(limit: usize) -> usize {
     }
 }
 
-fn app_matches_query(app: &AppRecord, query: &str) -> bool {
-    contains_query(&app.name, query)
-        || app
-            .generic_name
-            .as_deref()
-            .is_some_and(|value| contains_query(value, query))
-        || app
-            .comment
-            .as_deref()
-            .is_some_and(|value| contains_query(value, query))
-        || app
-            .keywords
-            .iter()
-            .any(|keyword| contains_query(keyword, query))
-        || app
-            .categories
-            .iter()
-            .any(|category| contains_query(category, query))
+fn score_app(app: &AppRecord, query: &str) -> i32 {
+    let normalized_name = normalize(&app.name);
+    let mut best_score = score_name(&normalized_name, query);
+
+    if exact_list_match(&app.keywords, query) || exact_list_match(&app.categories, query) {
+        best_score = best_score.max(KEYWORD_CATEGORY_EXACT_SCORE);
+    }
+
+    if optional_contains(&app.generic_name, query) || optional_contains(&app.comment, query) {
+        best_score = best_score.max(DESCRIPTION_CONTAINS_SCORE);
+    }
+
+    best_score
 }
 
-fn contains_query(value: &str, query: &str) -> bool {
-    value.to_lowercase().contains(query)
+fn score_name(name: &str, query: &str) -> i32 {
+    let base_score = if name == query {
+        EXACT_NAME_SCORE
+    } else if name.starts_with(query) {
+        NAME_PREFIX_SCORE
+    } else if name.contains(query) {
+        NAME_CONTAINS_SCORE
+    } else if abbreviation_matches(name, query) {
+        ABBREVIATION_SCORE
+    } else if subsequence_matches(name, query) {
+        SUBSEQUENCE_SCORE
+    } else {
+        0
+    };
+
+    if base_score >= NAME_CONTAINS_SCORE {
+        base_score + short_name_bonus(name)
+    } else {
+        base_score
+    }
+}
+
+fn short_name_bonus(name: &str) -> i32 {
+    let length = name.chars().filter(|ch| !ch.is_whitespace()).count() as i32;
+    (SHORT_NAME_BONUS_LIMIT - length).max(0)
+}
+
+fn exact_list_match(values: &[String], query: &str) -> bool {
+    values.iter().any(|value| normalize(value) == query)
+}
+
+fn optional_contains(value: &Option<String>, query: &str) -> bool {
+    value
+        .as_deref()
+        .is_some_and(|value| normalize(value).contains(query))
+}
+
+fn abbreviation_matches(name: &str, query: &str) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+
+    let initials = name
+        .split_whitespace()
+        .filter_map(|word| word.chars().next())
+        .collect::<String>();
+
+    initials == query
+        || initials.starts_with(query)
+        || (!initials.is_empty()
+            && query.starts_with(&initials)
+            && subsequence_matches(name, query))
+}
+
+fn subsequence_matches(name: &str, query: &str) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+
+    let mut query_chars = query.chars();
+    let mut current = query_chars.next();
+
+    for ch in name.chars() {
+        if Some(ch) == current {
+            current = query_chars.next();
+
+            if current.is_none() {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn compare_apps_alphabetically(left: &&AppRecord, right: &&AppRecord) -> std::cmp::Ordering {
+    normalize(&left.name)
+        .cmp(&normalize(&right.name))
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+fn normalize(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 impl From<&AppRecord> for AppSearchResult {
@@ -167,6 +268,34 @@ mod tests {
     }
 
     #[test]
+    fn exact_name_match_ranks_first() {
+        let results = search_apps(
+            &catalog(vec![
+                app("terminal-emulator.desktop", "Terminal Emulator"),
+                app("terminal.desktop", "Terminal"),
+            ]),
+            "terminal",
+            8,
+        );
+
+        assert_eq!(results[0].app_id, "terminal.desktop");
+    }
+
+    #[test]
+    fn prefix_name_match_beats_contains_match() {
+        let results = search_apps(
+            &catalog(vec![
+                app("wildfire.desktop", "Wildfire"),
+                app("firefox.desktop", "Firefox"),
+            ]),
+            "fire",
+            8,
+        );
+
+        assert_eq!(results[0].app_id, "firefox.desktop");
+    }
+
+    #[test]
     fn keyword_and_category_matches_return_apps() {
         let mut browser = app("browser.desktop", "Browser");
         browser.keywords = vec!["Web".to_owned(), "Internet".to_owned()];
@@ -177,6 +306,23 @@ mod tests {
         let results = search_apps(&catalog(vec![browser, settings]), "utility", 8);
 
         assert_eq!(results.len(), 1);
+        assert_eq!(results[0].app_id, "settings.desktop");
+    }
+
+    #[test]
+    fn keyword_and_category_exact_match_beats_description_contains() {
+        let mut exact_category = app("settings.desktop", "Settings");
+        exact_category.categories = vec!["Utility".to_owned()];
+
+        let mut comment_contains = app("manual.desktop", "Manual");
+        comment_contains.comment = Some("Utility documentation".to_owned());
+
+        let results = search_apps(
+            &catalog(vec![comment_contains, exact_category]),
+            "utility",
+            8,
+        );
+
         assert_eq!(results[0].app_id, "settings.desktop");
     }
 
@@ -196,10 +342,64 @@ mod tests {
     }
 
     #[test]
+    fn name_contains_beats_weak_fuzzy_match() {
+        let results = search_apps(
+            &catalog(vec![
+                app("environment.desktop", "Cool Desktop Environment"),
+                app("tool.desktop", "My Code Tool"),
+            ]),
+            "code",
+            8,
+        );
+
+        assert_eq!(results[0].app_id, "tool.desktop");
+    }
+
+    #[test]
+    fn abbreviation_match_can_find_firefox() {
+        let results = search_apps(&catalog(vec![app("firefox.desktop", "Firefox")]), "ff", 8);
+
+        assert_eq!(results[0].app_id, "firefox.desktop");
+    }
+
+    #[test]
+    fn subsequence_match_can_find_settings() {
+        let results = search_apps(
+            &catalog(vec![app("settings.desktop", "Settings")]),
+            "stg",
+            8,
+        );
+
+        assert_eq!(results[0].app_id, "settings.desktop");
+    }
+
+    #[test]
     fn no_match_returns_an_empty_list() {
         let results = search_apps(&catalog(vec![app("files.desktop", "Files")]), "firefox", 8);
 
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn score_ties_sort_alphabetically_then_by_id() {
+        let mut zed_same = app("zed.desktop", "Same");
+        zed_same.keywords = vec!["Utility".to_owned()];
+
+        let mut alpha_same = app("alpha.desktop", "Same");
+        alpha_same.keywords = vec!["Utility".to_owned()];
+
+        let mut bravo = app("bravo.desktop", "Bravo");
+        bravo.keywords = vec!["Utility".to_owned()];
+
+        let results = search_apps(&catalog(vec![zed_same, alpha_same, bravo]), "utility", 8);
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.app_id.as_str())
+                .collect::<Vec<_>>(),
+            ["bravo.desktop", "alpha.desktop", "zed.desktop"]
+        );
     }
 
     #[test]
