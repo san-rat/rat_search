@@ -28,6 +28,9 @@ src-tauri/.cargo/
 tmp/
 temp/
 
+# Local append-only work log
+docs/work/work_done.md
+
 # Editor / OS noise
 .vscode/*
 !.vscode/extensions.json
