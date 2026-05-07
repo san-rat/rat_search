@@ -10,13 +10,14 @@ mod app_discovery;
 mod app_launch;
 mod app_search;
 mod file_index;
+mod file_search;
 mod search_result;
 mod settings;
 
 use app_discovery::AppCatalog;
 use app_launch::LaunchResult;
 use file_index::FileIndex;
-use search_result::SearchResult;
+use search_result::{SearchResult, SearchSource};
 
 type FileIndexState = Arc<RwLock<FileIndex>>;
 
@@ -283,9 +284,63 @@ fn start_file_index_scan(file_index: FileIndexState) {
     });
 }
 
+fn search_all(
+    catalog: &AppCatalog,
+    file_index: Option<&FileIndex>,
+    query: &str,
+    limit: usize,
+) -> Vec<SearchResult> {
+    let limit = settings::normalize_result_limit(limit);
+    let mut results = app_search::search_apps(catalog, query, limit);
+
+    if let Some(file_index) = file_index {
+        results.extend(file_search::search_files(file_index, query, limit));
+    }
+
+    results.sort_by(compare_search_results);
+    results.truncate(limit);
+    results
+}
+
+fn compare_search_results(left: &SearchResult, right: &SearchResult) -> std::cmp::Ordering {
+    right
+        .score
+        .cmp(&left.score)
+        .then_with(|| source_priority(&left.source).cmp(&source_priority(&right.source)))
+        .then_with(|| normalize_search_text(&left.title).cmp(&normalize_search_text(&right.title)))
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+fn source_priority(source: &SearchSource) -> u8 {
+    match source {
+        SearchSource::Applications => 0,
+        SearchSource::Folders => 1,
+        SearchSource::Files => 2,
+    }
+}
+
+fn normalize_search_text(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 #[tauri::command]
-fn search(catalog: tauri::State<'_, AppCatalog>, query: String, limit: usize) -> Vec<SearchResult> {
-    app_search::search_apps(&catalog, &query, limit)
+fn search(
+    catalog: tauri::State<'_, AppCatalog>,
+    file_index: tauri::State<'_, FileIndexState>,
+    query: String,
+    limit: usize,
+) -> Vec<SearchResult> {
+    match file_index.read() {
+        Ok(index) => search_all(&catalog, Some(&index), &query, limit),
+        Err(error) => {
+            eprintln!("failed to read file index for search: {error}");
+            search_all(&catalog, None, &query, limit)
+        }
+    }
 }
 
 #[tauri::command]
@@ -371,4 +426,107 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::{
+        app_discovery::{AppCatalog, AppRecord},
+        file_index::{FileIndex, FileRecord},
+        search_result::SearchSource,
+    };
+
+    use super::*;
+
+    fn app(id: &str, name: &str) -> AppRecord {
+        AppRecord {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            generic_name: None,
+            comment: None,
+            exec: name.to_lowercase(),
+            icon: None,
+            categories: Vec::new(),
+            keywords: Vec::new(),
+            desktop_file_path: format!("/tmp/{id}"),
+            terminal: false,
+        }
+    }
+
+    fn catalog(apps: Vec<AppRecord>) -> AppCatalog {
+        AppCatalog { apps }
+    }
+
+    fn file(path: &str) -> FileRecord {
+        FileRecord::new(PathBuf::from(path), false, None, Some(10))
+    }
+
+    fn folder(path: &str) -> FileRecord {
+        FileRecord::new(PathBuf::from(path), true, None, None)
+    }
+
+    fn index(records: Vec<FileRecord>) -> FileIndex {
+        FileIndex::from_records(records)
+    }
+
+    #[test]
+    fn mixed_search_keeps_strong_app_above_noisy_file_match() {
+        let app_catalog = catalog(vec![app("report.desktop", "Report")]);
+        let file_index = index(vec![file("/home/sanuk/Documents/Annual Report.pdf")]);
+
+        let results = search_all(&app_catalog, Some(&file_index), "report", 8);
+
+        assert_eq!(results[0].source, SearchSource::Applications);
+        assert_eq!(results[0].title, "Report");
+        assert_eq!(results[1].source, SearchSource::Files);
+    }
+
+    #[test]
+    fn mixed_search_applies_final_limit_after_merging_sources() {
+        let app_catalog = catalog(vec![app("calendar.desktop", "Calendar")]);
+        let file_index = index(vec![
+            file("/home/sanuk/Documents/Report.pdf"),
+            folder("/home/sanuk/Documents/Reports"),
+        ]);
+
+        let results = search_all(&app_catalog, Some(&file_index), "report", 1);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Reports");
+        assert_eq!(results[0].source, SearchSource::Folders);
+    }
+
+    #[test]
+    fn mixed_search_ties_sort_by_source_then_title_then_id() {
+        let app_catalog = AppCatalog::default();
+        let first_file = file("/home/sanuk/Documents/Alpha");
+        let folder = folder("/home/sanuk/Documents/Alpha");
+        let second_file = file("/home/sanuk/Documents/Beta");
+        let file_index = index(vec![second_file, first_file, folder]);
+
+        let results = search_all(&app_catalog, Some(&file_index), "alpha", 8);
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| (result.source.clone(), result.title.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (SearchSource::Folders, "Alpha"),
+                (SearchSource::Files, "Alpha")
+            ]
+        );
+    }
+
+    #[test]
+    fn mixed_search_falls_back_to_apps_without_file_index() {
+        let app_catalog = catalog(vec![app("settings.desktop", "Settings")]);
+
+        let results = search_all(&app_catalog, None, "settings", 8);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source, SearchSource::Applications);
+    }
 }

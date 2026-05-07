@@ -9,6 +9,13 @@ pub(crate) const DEFAULT_SEARCH_SOURCE: &str = "applications only";
 pub(crate) const DEFAULT_INDEX_ROOT_NAMES: [&str; 4] =
     ["Desktop", "Documents", "Downloads", "Pictures"];
 
+pub(crate) fn normalize_result_limit(limit: usize) -> usize {
+    match limit {
+        0 => DEFAULT_MAX_RESULTS,
+        limit => limit.min(RESULT_LIMIT_CAP),
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub(crate) const DEFAULT_HOTKEY_MODIFIERS: tauri_plugin_global_shortcut::Modifiers =
     tauri_plugin_global_shortcut::Modifiers::ALT;

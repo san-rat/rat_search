@@ -15,7 +15,7 @@ const SHORT_NAME_BONUS_LIMIT: i32 = 50;
 
 pub(crate) fn search_apps(catalog: &AppCatalog, query: &str, limit: usize) -> Vec<SearchResult> {
     let query = normalize(query);
-    let limit = normalize_limit(limit);
+    let limit = settings::normalize_result_limit(limit);
 
     if query.is_empty() {
         let mut apps = catalog.apps.iter().collect::<Vec<_>>();
@@ -48,13 +48,6 @@ pub(crate) fn search_apps(catalog: &AppCatalog, query: &str, limit: usize) -> Ve
         .take(limit)
         .map(|(app, score)| search_result_from_app(app, score))
         .collect()
-}
-
-fn normalize_limit(limit: usize) -> usize {
-    match limit {
-        0 => settings::DEFAULT_MAX_RESULTS,
-        limit => limit.min(settings::RESULT_LIMIT_CAP),
-    }
 }
 
 fn score_app(app: &AppRecord, query: &str) -> i32 {
