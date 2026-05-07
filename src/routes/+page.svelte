@@ -452,32 +452,36 @@
       />
     </div>
 
-    {#if isExpanded && results.length > 0}
-      <ul class="results-list" aria-label="Search results">
-        {#each results as result, index (result.id)}
-          {@const imageSrc = iconImageSrc(result.icon)}
-          {@const symbolicClass = symbolicIconClass(result.icon)}
-          {@const subtitle = displaySubtitle(result)}
-          <li class:selected={index === selectedIndex} class="result-row">
-            <span class="app-icon" aria-hidden="true">
-              {#if imageSrc}
-                <img src={imageSrc} alt="" />
-              {:else if symbolicClass}
-                <span class={symbolicClass}></span>
-              {:else}
-                <span>{iconFallback(result.title)}</span>
-              {/if}
-            </span>
-            <span class="result-copy">
-              <span class="result-title">{result.title}</span>
-              <span class="result-subtitle">{subtitle}</span>
-            </span>
-            <span class="result-source">{sourceLabel(result.source)}</span>
-          </li>
-        {/each}
-      </ul>
-    {:else if isExpanded && query.trim().length > 0}
-      <div class="empty-state">{searchError ?? "No results"}</div>
+    {#if isExpanded}
+      <div class="results-region">
+        {#if results.length > 0}
+          <ul class="results-list" aria-label="Search results">
+            {#each results as result, index (result.id)}
+              {@const imageSrc = iconImageSrc(result.icon)}
+              {@const symbolicClass = symbolicIconClass(result.icon)}
+              {@const subtitle = displaySubtitle(result)}
+              <li class:selected={index === selectedIndex} class="result-row">
+                <span class="app-icon" aria-hidden="true">
+                  {#if imageSrc}
+                    <img src={imageSrc} alt="" />
+                  {:else if symbolicClass}
+                    <span class={symbolicClass}></span>
+                  {:else}
+                    <span>{iconFallback(result.title)}</span>
+                  {/if}
+                </span>
+                <span class="result-copy">
+                  <span class="result-title">{result.title}</span>
+                  <span class="result-subtitle">{subtitle}</span>
+                </span>
+                <span class="result-source">{sourceLabel(result.source)}</span>
+              </li>
+            {/each}
+          </ul>
+        {:else if query.trim().length > 0}
+          <div class="empty-state">{searchError ?? "No results"}</div>
+        {/if}
+      </div>
     {/if}
 
     {#if isExpanded && actionError}
@@ -651,6 +655,23 @@
   .search-input::placeholder {
     color: rgba(58, 60, 67, 0.45);
     opacity: 1;
+  }
+
+  .results-region {
+    min-height: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden !important;
+  }
+
+  .results-region > .results-list,
+  .results-region > .empty-state {
+    opacity: 1;
+    transform: translateY(0);
+    transition:
+      opacity 120ms ease-out,
+      transform 120ms ease-out;
+    animation: results-reveal 120ms ease-out;
   }
 
   .results-list {
@@ -872,6 +893,18 @@
     font-size: 14px;
   }
 
+  @keyframes results-reveal {
+    from {
+      opacity: 0;
+      transform: translateY(-6px);
+    }
+
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
   .status-message {
     position: absolute;
     right: 16px;
@@ -899,6 +932,15 @@
   @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
     .command-palette {
       background: rgba(247, 248, 250, 0.98);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .results-region > .results-list,
+    .results-region > .empty-state {
+      animation: none;
+      transform: none;
+      transition: none;
     }
   }
 
