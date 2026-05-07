@@ -10,12 +10,14 @@ mod app_discovery;
 mod app_icons;
 mod app_launch;
 mod app_search;
+mod calculator;
 mod file_actions;
 mod file_icons;
 mod file_index;
 mod file_search;
 mod search_result;
 mod settings;
+mod web_shortcuts;
 
 use app_discovery::AppCatalog;
 use app_launch::LaunchResult;
