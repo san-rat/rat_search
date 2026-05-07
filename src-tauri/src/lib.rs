@@ -5,6 +5,7 @@ use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Size, We
 mod app_discovery;
 mod app_launch;
 mod app_search;
+mod search_result;
 mod settings;
 
 use app_discovery::AppCatalog;
