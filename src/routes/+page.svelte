@@ -40,6 +40,7 @@
 
   let query = $state("");
   let isExpanded = $state(false);
+  let isCollapsing = $state(false);
   let results = $state<SearchResult[]>([]);
   let selectedIndex = $state(-1);
   let searchError = $state<string | null>(null);
@@ -48,6 +49,9 @@
   let searchInput: HTMLInputElement;
   let searchRequestId = 0;
   let requestedExpandedState: boolean | null = null;
+  let collapseTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const COLLAPSE_TRANSITION_MS = 120;
 
   $effect(() => {
     void loadResults(query);
@@ -57,24 +61,69 @@
     requestAnimationFrame(() => searchInput?.focus());
   }
 
+  function prefersReducedMotion() {
+    return (
+      typeof window !== "undefined" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    );
+  }
+
+  function clearResultState() {
+    results = [];
+    selectedIndex = -1;
+    searchError = null;
+    actionError = null;
+  }
+
+  function clearCollapseTimer() {
+    if (collapseTimer) {
+      clearTimeout(collapseTimer);
+      collapseTimer = null;
+    }
+  }
+
+  function collapseToCompactNow() {
+    clearCollapseTimer();
+    clearResultState();
+    isExpanded = false;
+    isCollapsing = false;
+
+    if (isTauri()) {
+      void setNativeExpanded(false);
+    }
+  }
+
+  function cancelPendingCollapse() {
+    clearCollapseTimer();
+    isCollapsing = false;
+  }
+
+  function startCollapseToCompact() {
+    if (!isExpanded || prefersReducedMotion()) {
+      collapseToCompactNow();
+      return;
+    }
+
+    clearCollapseTimer();
+    searchError = null;
+    actionError = null;
+    isCollapsing = true;
+
+    collapseTimer = setTimeout(() => {
+      collapseToCompactNow();
+    }, COLLAPSE_TRANSITION_MS);
+  }
+
   async function loadResults(searchQuery: string) {
     const requestId = ++searchRequestId;
     const trimmedQuery = searchQuery.trim();
 
     if (trimmedQuery.length === 0) {
-      results = [];
-      selectedIndex = -1;
-      searchError = null;
-      actionError = null;
-      isExpanded = false;
-
-      if (isTauri()) {
-        void setNativeExpanded(false);
-      }
-
+      startCollapseToCompact();
       return;
     }
 
+    cancelPendingCollapse();
     isExpanded = true;
 
     if (!isTauri()) {
@@ -273,6 +322,7 @@
         isFileSystemResult(selected) &&
         selected.path &&
         !isRunningAction &&
+        !isCollapsing &&
         (action === "reveal_path" || action === "copy_path"),
     );
   }
@@ -300,7 +350,7 @@
   async function runSelectedResultAction(actionOverride?: ShortcutAction) {
     const selected = selectedResult();
 
-    if (!selected || isRunningAction || !isTauri()) {
+    if (!selected || isRunningAction || isCollapsing || !isTauri()) {
       return;
     }
 
@@ -366,6 +416,7 @@
 
     return () => {
       disposed = true;
+      clearCollapseTimer();
       unlisten?.();
     };
   });
@@ -453,7 +504,7 @@
     </div>
 
     {#if isExpanded}
-      <div class="results-region">
+      <div class:collapsing={isCollapsing} class="results-region">
         {#if results.length > 0}
           <ul class="results-list" aria-label="Search results">
             {#each results as result, index (result.id)}
@@ -478,7 +529,7 @@
               </li>
             {/each}
           </ul>
-        {:else if query.trim().length > 0}
+        {:else if query.trim().length > 0 || isCollapsing}
           <div class="empty-state">{searchError ?? "No results"}</div>
         {/if}
       </div>
@@ -672,6 +723,12 @@
       opacity 120ms ease-out,
       transform 120ms ease-out;
     animation: results-reveal 120ms ease-out;
+  }
+
+  .results-region.collapsing > .results-list,
+  .results-region.collapsing > .empty-state {
+    opacity: 0;
+    transform: translateY(-6px);
   }
 
   .results-list {
@@ -937,7 +994,9 @@
 
   @media (prefers-reduced-motion: reduce) {
     .results-region > .results-list,
-    .results-region > .empty-state {
+    .results-region > .empty-state,
+    .results-region.collapsing > .results-list,
+    .results-region.collapsing > .empty-state {
       animation: none;
       transform: none;
       transition: none;
