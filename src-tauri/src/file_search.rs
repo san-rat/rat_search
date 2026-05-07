@@ -1,4 +1,4 @@
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::{
     file_icons,
@@ -177,6 +177,7 @@ fn search_result_from_record(record: &FileRecord, score: i32) -> SearchResult {
     } else {
         SearchMetadata::File {
             extension: record.extension.clone(),
+            modified_time_ms: modified_time_ms(record.modified_time),
         }
     };
 
@@ -191,6 +192,13 @@ fn search_result_from_record(record: &FileRecord, score: i32) -> SearchResult {
         score,
         metadata: Some(metadata),
     }
+}
+
+fn modified_time_ms(modified_time: Option<SystemTime>) -> Option<u64> {
+    modified_time?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
 }
 
 #[cfg(test)]
@@ -361,7 +369,31 @@ mod tests {
         assert_eq!(
             file_result.metadata,
             Some(SearchMetadata::File {
-                extension: Some("pdf".to_owned())
+                extension: Some("pdf".to_owned()),
+                modified_time_ms: None
+            })
+        );
+    }
+
+    #[test]
+    fn file_metadata_includes_modified_time_without_changing_order() {
+        let modified_time = UNIX_EPOCH + Duration::from_millis(1_700_000_000_123);
+        let mut report = file("/home/sanuk/Documents/Report.pdf");
+        report.modified_time = Some(modified_time);
+        let annual_report = file("/home/sanuk/Documents/Annual Report.pdf");
+
+        let results = search_files(&index(vec![annual_report, report]), "report", 8);
+        let report_result = results
+            .iter()
+            .find(|result| result.title == "Report.pdf")
+            .expect("report result should exist");
+
+        assert_eq!(results[0].title, "Report.pdf");
+        assert_eq!(
+            report_result.metadata,
+            Some(SearchMetadata::File {
+                extension: Some("pdf".to_owned()),
+                modified_time_ms: Some(1_700_000_000_123)
             })
         );
     }

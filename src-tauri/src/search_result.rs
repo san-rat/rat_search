@@ -35,8 +35,14 @@ pub(crate) struct SearchResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum SearchMetadata {
-    Application { app_id: String, terminal: bool },
-    File { extension: Option<String> },
+    Application {
+        app_id: String,
+        terminal: bool,
+    },
+    File {
+        extension: Option<String>,
+        modified_time_ms: Option<u64>,
+    },
     Folder,
 }
 
@@ -115,6 +121,22 @@ mod tests {
                     "app_id": "firefox.desktop",
                     "terminal": false
                 }
+            })
+        );
+    }
+
+    #[test]
+    fn file_metadata_serializes_modified_time() {
+        assert_eq!(
+            serde_json::to_value(SearchMetadata::File {
+                extension: Some("pdf".to_owned()),
+                modified_time_ms: Some(1_700_000_000_123),
+            })
+            .expect("file metadata should serialize"),
+            json!({
+                "kind": "file",
+                "extension": "pdf",
+                "modified_time_ms": 1_700_000_000_123_u64
             })
         );
     }

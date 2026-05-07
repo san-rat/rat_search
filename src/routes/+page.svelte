@@ -6,6 +6,24 @@
   type SearchSource = "applications" | "files" | "folders";
   type SearchAction = "launch_app" | "open_path" | "reveal_path" | "copy_path";
 
+  type ApplicationMetadata = {
+    kind: "application";
+    app_id: string;
+    terminal: boolean;
+  };
+
+  type FileMetadata = {
+    kind: "file";
+    extension: string | null;
+    modified_time_ms: number | null;
+  };
+
+  type FolderMetadata = {
+    kind: "folder";
+  };
+
+  type SearchMetadata = ApplicationMetadata | FileMetadata | FolderMetadata;
+
   type SearchResult = {
     id: string;
     title: string;
@@ -15,7 +33,7 @@
     action: SearchAction;
     path: string | null;
     score: number;
-    metadata: unknown | null;
+    metadata: SearchMetadata | null;
   };
 
   let query = $state("");
@@ -155,6 +173,64 @@
       default:
         return null;
     }
+  }
+
+  function sourceLabel(source: SearchSource) {
+    switch (source) {
+      case "applications":
+        return "App";
+      case "files":
+        return "File";
+      case "folders":
+        return "Folder";
+    }
+  }
+
+  function displaySubtitle(result: SearchResult) {
+    if (result.source === "applications") {
+      return result.subtitle ?? "";
+    }
+
+    if (result.source === "folders") {
+      return joinSubtitleParts([result.subtitle, "Folder"]);
+    }
+
+    const metadata = result.metadata?.kind === "file" ? result.metadata : null;
+    return joinSubtitleParts([
+      result.subtitle,
+      extensionLabel(metadata?.extension ?? null),
+      modifiedLabel(metadata?.modified_time_ms ?? null),
+    ]);
+  }
+
+  function joinSubtitleParts(parts: Array<string | null | undefined>) {
+    return parts.map((part) => part?.trim()).filter(Boolean).join(" - ");
+  }
+
+  function extensionLabel(extension: string | null) {
+    const value = extension?.trim();
+    return value ? value.toUpperCase() : "File";
+  }
+
+  function modifiedLabel(modifiedTimeMs: number | null) {
+    if (modifiedTimeMs === null || !Number.isFinite(modifiedTimeMs)) {
+      return null;
+    }
+
+    const elapsedMs = Date.now() - modifiedTimeMs;
+    const dayMs = 24 * 60 * 60 * 1000;
+
+    if (elapsedMs < dayMs) {
+      return "Modified recently";
+    }
+
+    const days = Math.max(1, Math.floor(elapsedMs / dayMs));
+
+    if (days === 1) {
+      return "Modified yesterday";
+    }
+
+    return `Modified ${days} days ago`;
   }
 
   function iconFallback(title: string) {
@@ -314,6 +390,7 @@
         {#each results as result, index (result.id)}
           {@const imageSrc = iconImageSrc(result.icon)}
           {@const symbolicClass = symbolicIconClass(result.icon)}
+          {@const subtitle = displaySubtitle(result)}
           <li class:selected={index === selectedIndex} class="result-row">
             <span class="app-icon" aria-hidden="true">
               {#if imageSrc}
@@ -325,10 +402,11 @@
               {/if}
             </span>
             <span class="result-copy">
-              <span class="result-title">{result.title}</span>
-              {#if result.subtitle}
-                <span class="result-subtitle">{result.subtitle}</span>
-              {/if}
+              <span class="result-title-row">
+                <span class="result-title">{result.title}</span>
+                <span class="result-source">{sourceLabel(result.source)}</span>
+              </span>
+              <span class="result-subtitle">{subtitle}</span>
             </span>
           </li>
         {/each}
@@ -680,12 +758,23 @@
   .result-copy {
     min-width: 0;
     display: grid;
+    grid-template-rows: 17px 14px;
     gap: 1px;
     overflow: hidden;
   }
 
+  .result-title-row {
+    min-width: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 8px;
+    overflow: hidden;
+  }
+
   .result-title,
-  .result-subtitle {
+  .result-subtitle,
+  .result-source {
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -696,6 +785,18 @@
     font-size: 14px;
     font-weight: 600;
     line-height: 1.15;
+  }
+
+  .result-source {
+    max-width: 58px;
+    padding: 2px 6px;
+    border-radius: 6px;
+    background: rgba(58, 60, 67, 0.1);
+    color: rgba(58, 60, 67, 0.62);
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1;
+    text-transform: uppercase;
   }
 
   .result-subtitle {
@@ -784,6 +885,11 @@
     .app-icon {
       background: rgba(246, 247, 249, 0.12);
       color: rgba(246, 247, 249, 0.8);
+    }
+
+    .result-source {
+      background: rgba(246, 247, 249, 0.12);
+      color: rgba(246, 247, 249, 0.58);
     }
 
     .symbolic-file::after {
