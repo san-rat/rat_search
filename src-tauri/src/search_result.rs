@@ -8,6 +8,10 @@ pub(crate) enum SearchSource {
     Applications,
     Files,
     Folders,
+    Calculator,
+    Web,
+    Settings,
+    History,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -17,6 +21,10 @@ pub(crate) enum SearchAction {
     OpenPath,
     RevealPath,
     CopyPath,
+    CopyText,
+    OpenUrl,
+    OpenSetting,
+    ReuseQuery,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -44,6 +52,26 @@ pub(crate) enum SearchMetadata {
         modified_time_ms: Option<u64>,
     },
     Folder,
+    Calculator {
+        expression: String,
+        result: String,
+        copy_text: String,
+    },
+    Web {
+        shortcut: String,
+        query: String,
+        url: String,
+    },
+    Setting {
+        setting_id: String,
+        panel: String,
+        command: String,
+    },
+    History {
+        query: String,
+        last_used_ms: u64,
+        use_count: u32,
+    },
 }
 
 #[cfg(test)]
@@ -66,6 +94,22 @@ mod tests {
             serde_json::to_value(SearchSource::Folders).expect("source should serialize"),
             json!("folders")
         );
+        assert_eq!(
+            serde_json::to_value(SearchSource::Calculator).expect("source should serialize"),
+            json!("calculator")
+        );
+        assert_eq!(
+            serde_json::to_value(SearchSource::Web).expect("source should serialize"),
+            json!("web")
+        );
+        assert_eq!(
+            serde_json::to_value(SearchSource::Settings).expect("source should serialize"),
+            json!("settings")
+        );
+        assert_eq!(
+            serde_json::to_value(SearchSource::History).expect("source should serialize"),
+            json!("history")
+        );
     }
 
     #[test]
@@ -85,6 +129,22 @@ mod tests {
         assert_eq!(
             serde_json::to_value(SearchAction::CopyPath).expect("action should serialize"),
             json!("copy_path")
+        );
+        assert_eq!(
+            serde_json::to_value(SearchAction::CopyText).expect("action should serialize"),
+            json!("copy_text")
+        );
+        assert_eq!(
+            serde_json::to_value(SearchAction::OpenUrl).expect("action should serialize"),
+            json!("open_url")
+        );
+        assert_eq!(
+            serde_json::to_value(SearchAction::OpenSetting).expect("action should serialize"),
+            json!("open_setting")
+        );
+        assert_eq!(
+            serde_json::to_value(SearchAction::ReuseQuery).expect("action should serialize"),
+            json!("reuse_query")
         );
     }
 
@@ -137,6 +197,78 @@ mod tests {
                 "kind": "file",
                 "extension": "pdf",
                 "modified_time_ms": 1_700_000_000_123_u64
+            })
+        );
+    }
+
+    #[test]
+    fn calculator_metadata_serializes_to_frontend_shape() {
+        assert_eq!(
+            serde_json::to_value(SearchMetadata::Calculator {
+                expression: "2+2".to_owned(),
+                result: "4".to_owned(),
+                copy_text: "4".to_owned(),
+            })
+            .expect("calculator metadata should serialize"),
+            json!({
+                "kind": "calculator",
+                "expression": "2+2",
+                "result": "4",
+                "copy_text": "4"
+            })
+        );
+    }
+
+    #[test]
+    fn web_metadata_serializes_to_frontend_shape() {
+        assert_eq!(
+            serde_json::to_value(SearchMetadata::Web {
+                shortcut: "g".to_owned(),
+                query: "rust tauri".to_owned(),
+                url: "https://www.google.com/search?q=rust%20tauri".to_owned(),
+            })
+            .expect("web metadata should serialize"),
+            json!({
+                "kind": "web",
+                "shortcut": "g",
+                "query": "rust tauri",
+                "url": "https://www.google.com/search?q=rust%20tauri"
+            })
+        );
+    }
+
+    #[test]
+    fn setting_metadata_serializes_to_frontend_shape() {
+        assert_eq!(
+            serde_json::to_value(SearchMetadata::Setting {
+                setting_id: "wifi".to_owned(),
+                panel: "wifi".to_owned(),
+                command: "gnome-control-center wifi".to_owned(),
+            })
+            .expect("setting metadata should serialize"),
+            json!({
+                "kind": "setting",
+                "setting_id": "wifi",
+                "panel": "wifi",
+                "command": "gnome-control-center wifi"
+            })
+        );
+    }
+
+    #[test]
+    fn history_metadata_serializes_to_frontend_shape() {
+        assert_eq!(
+            serde_json::to_value(SearchMetadata::History {
+                query: "wifi".to_owned(),
+                last_used_ms: 1_700_000_000_123,
+                use_count: 3,
+            })
+            .expect("history metadata should serialize"),
+            json!({
+                "kind": "history",
+                "query": "wifi",
+                "last_used_ms": 1_700_000_000_123_u64,
+                "use_count": 3
             })
         );
     }

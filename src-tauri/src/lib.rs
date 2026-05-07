@@ -399,8 +399,12 @@ fn compare_search_results(left: &SearchResult, right: &SearchResult) -> std::cmp
 fn source_priority(source: &SearchSource) -> u8 {
     match source {
         SearchSource::Applications => 0,
-        SearchSource::Folders => 1,
-        SearchSource::Files => 2,
+        SearchSource::Calculator => 1,
+        SearchSource::Settings => 2,
+        SearchSource::Folders => 3,
+        SearchSource::Files => 4,
+        SearchSource::Web => 5,
+        SearchSource::History => 6,
     }
 }
 
