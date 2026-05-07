@@ -68,7 +68,7 @@
     try {
       await setNativeExpanded(true);
 
-      const nextResults = await invoke<SearchResult[]>("search_apps", {
+      const nextResults = await invoke<SearchResult[]>("search", {
         query: trimmedQuery,
         limit: 0,
       });

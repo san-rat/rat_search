@@ -251,11 +251,7 @@ fn hide_launcher(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn search_apps(
-    catalog: tauri::State<'_, AppCatalog>,
-    query: String,
-    limit: usize,
-) -> Vec<SearchResult> {
+fn search(catalog: tauri::State<'_, AppCatalog>, query: String, limit: usize) -> Vec<SearchResult> {
     app_search::search_apps(&catalog, &query, limit)
 }
 
@@ -303,7 +299,7 @@ pub fn run() {
             close_launcher,
             hide_launcher,
             launch_app,
-            search_apps,
+            search,
             set_launcher_expanded
         ])
         .setup(|app| {
