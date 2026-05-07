@@ -17,6 +17,7 @@ mod file_index;
 mod file_search;
 mod search_result;
 mod settings;
+mod settings_search;
 mod web_shortcuts;
 
 use app_discovery::AppCatalog;
