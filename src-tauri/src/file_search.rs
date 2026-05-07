@@ -1,6 +1,7 @@
 use std::time::{Duration, SystemTime};
 
 use crate::{
+    file_icons,
     file_index::{FileIndex, FileRecord},
     search_result::{SearchAction, SearchMetadata, SearchResult, SearchSource},
     settings,
@@ -183,7 +184,7 @@ fn search_result_from_record(record: &FileRecord, score: i32) -> SearchResult {
         id: record.id.clone(),
         title: record.file_name.clone(),
         subtitle: Some(record.parent_path.to_string_lossy().into_owned()),
-        icon: Some(if record.is_dir { "folder" } else { "file" }.to_owned()),
+        icon: Some(file_icons::icon_for_record(record).to_owned()),
         source,
         action: SearchAction::OpenPath,
         path: Some(record.path.to_string_lossy().into_owned()),
@@ -352,7 +353,7 @@ mod tests {
         assert_eq!(folder_result.metadata, Some(SearchMetadata::Folder));
 
         assert_eq!(file_result.action, SearchAction::OpenPath);
-        assert_eq!(file_result.icon.as_deref(), Some("file"));
+        assert_eq!(file_result.icon.as_deref(), Some("file-pdf"));
         assert!(file_result
             .path
             .as_deref()

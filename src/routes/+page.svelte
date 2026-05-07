@@ -130,6 +130,33 @@
     return null;
   }
 
+  function symbolicIconClass(icon: string | null) {
+    switch (icon) {
+      case "app":
+        return "symbolic-icon symbolic-app";
+      case "folder":
+        return "symbolic-icon symbolic-folder";
+      case "file":
+        return "symbolic-icon symbolic-file";
+      case "file-pdf":
+        return "symbolic-icon symbolic-file symbolic-file-pdf";
+      case "file-text":
+        return "symbolic-icon symbolic-file symbolic-file-text";
+      case "file-image":
+        return "symbolic-icon symbolic-file symbolic-file-image";
+      case "file-video":
+        return "symbolic-icon symbolic-file symbolic-file-video";
+      case "file-audio":
+        return "symbolic-icon symbolic-file symbolic-file-audio";
+      case "file-archive":
+        return "symbolic-icon symbolic-file symbolic-file-archive";
+      case "file-document":
+        return "symbolic-icon symbolic-file symbolic-file-document";
+      default:
+        return null;
+    }
+  }
+
   function iconFallback(title: string) {
     return title.trim().charAt(0).toUpperCase() || "?";
   }
@@ -286,12 +313,13 @@
       <ul class="results-list" aria-label="Search results">
         {#each results as result, index (result.id)}
           {@const imageSrc = iconImageSrc(result.icon)}
+          {@const symbolicClass = symbolicIconClass(result.icon)}
           <li class:selected={index === selectedIndex} class="result-row">
             <span class="app-icon" aria-hidden="true">
               {#if imageSrc}
                 <img src={imageSrc} alt="" />
-              {:else if result.icon === "app"}
-                <span class="generic-app-icon"></span>
+              {:else if symbolicClass}
+                <span class={symbolicClass}></span>
               {:else}
                 <span>{iconFallback(result.title)}</span>
               {/if}
@@ -535,15 +563,20 @@
     object-fit: contain;
   }
 
-  .generic-app-icon {
+  .symbolic-icon {
     position: relative;
-    width: 18px;
-    height: 18px;
     display: block;
+    width: 20px;
+    height: 20px;
     color: currentColor;
   }
 
-  .generic-app-icon::before {
+  .symbolic-app {
+    width: 18px;
+    height: 18px;
+  }
+
+  .symbolic-app::before {
     content: "";
     position: absolute;
     top: 1px;
@@ -557,6 +590,91 @@
       0 9px 0 currentColor,
       9px 9px 0 currentColor;
     opacity: 0.78;
+  }
+
+  .symbolic-folder {
+    width: 22px;
+    height: 18px;
+  }
+
+  .symbolic-folder::before {
+    content: "";
+    position: absolute;
+    left: 1px;
+    top: 5px;
+    width: 20px;
+    height: 12px;
+    border-radius: 3px;
+    background: currentColor;
+    opacity: 0.72;
+  }
+
+  .symbolic-folder::after {
+    content: "";
+    position: absolute;
+    left: 2px;
+    top: 2px;
+    width: 9px;
+    height: 5px;
+    border-radius: 3px 3px 0 0;
+    background: currentColor;
+    opacity: 0.62;
+  }
+
+  .symbolic-file {
+    width: 18px;
+    height: 21px;
+  }
+
+  .symbolic-file::before {
+    content: "";
+    position: absolute;
+    inset: 1px 3px 1px 2px;
+    border: 1.8px solid currentColor;
+    border-radius: 3px;
+    opacity: 0.78;
+  }
+
+  .symbolic-file::after {
+    content: "";
+    position: absolute;
+    right: 3px;
+    top: 1px;
+    width: 6px;
+    height: 6px;
+    border-left: 1.8px solid currentColor;
+    border-bottom: 1.8px solid currentColor;
+    border-radius: 0 3px 0 2px;
+    background: rgba(246, 247, 248, 0.95);
+    opacity: 0.78;
+  }
+
+  .symbolic-file-pdf::before {
+    color: rgba(206, 48, 48, 0.92);
+  }
+
+  .symbolic-file-text::before {
+    color: rgba(58, 91, 168, 0.9);
+  }
+
+  .symbolic-file-image::before {
+    color: rgba(33, 139, 91, 0.9);
+  }
+
+  .symbolic-file-video::before {
+    color: rgba(145, 75, 198, 0.9);
+  }
+
+  .symbolic-file-audio::before {
+    color: rgba(196, 111, 32, 0.92);
+  }
+
+  .symbolic-file-archive::before {
+    color: rgba(128, 91, 48, 0.92);
+  }
+
+  .symbolic-file-document::before {
+    color: rgba(44, 111, 184, 0.9);
   }
 
   .result-copy {
@@ -666,6 +784,10 @@
     .app-icon {
       background: rgba(246, 247, 249, 0.12);
       color: rgba(246, 247, 249, 0.8);
+    }
+
+    .symbolic-file::after {
+      background: rgba(39, 40, 44, 0.95);
     }
 
     .result-subtitle,

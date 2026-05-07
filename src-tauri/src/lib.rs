@@ -11,6 +11,7 @@ mod app_icons;
 mod app_launch;
 mod app_search;
 mod file_actions;
+mod file_icons;
 mod file_index;
 mod file_search;
 mod search_result;
