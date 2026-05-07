@@ -10,7 +10,7 @@ mod settings;
 
 use app_discovery::AppCatalog;
 use app_launch::LaunchResult;
-use app_search::AppSearchResult;
+use search_result::SearchResult;
 
 const LAUNCHER_WINDOW_LABEL: &str = "main";
 const LAUNCHER_SHOWN_EVENT: &str = "launcher:shown";
@@ -255,7 +255,7 @@ fn search_apps(
     catalog: tauri::State<'_, AppCatalog>,
     query: String,
     limit: usize,
-) -> Vec<AppSearchResult> {
+) -> Vec<SearchResult> {
     app_search::search_apps(&catalog, &query, limit)
 }
 

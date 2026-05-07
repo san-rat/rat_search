@@ -3,17 +3,24 @@
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
 
-  type AppSearchResult = {
-    app_id: string;
+  type SearchSource = "applications" | "files" | "folders";
+  type SearchAction = "launch_app" | "open_path" | "reveal_path" | "copy_path";
+
+  type SearchResult = {
+    id: string;
     title: string;
     subtitle: string | null;
     icon: string | null;
-    terminal: boolean;
+    source: SearchSource;
+    action: SearchAction;
+    path: string | null;
+    score: number;
+    metadata: unknown | null;
   };
 
   let query = $state("");
   let isExpanded = $state(false);
-  let results = $state<AppSearchResult[]>([]);
+  let results = $state<SearchResult[]>([]);
   let selectedIndex = $state(-1);
   let searchError = $state<string | null>(null);
   let launchError = $state<string | null>(null);
@@ -61,7 +68,7 @@
     try {
       await setNativeExpanded(true);
 
-      const nextResults = await invoke<AppSearchResult[]>("search_apps", {
+      const nextResults = await invoke<SearchResult[]>("search_apps", {
         query: trimmedQuery,
         limit: 0,
       });
@@ -148,7 +155,7 @@
   async function launchSelectedResult() {
     const selected = selectedResult();
 
-    if (!selected || isLaunching || !isTauri()) {
+    if (!selected || selected.action !== "launch_app" || isLaunching || !isTauri()) {
       return;
     }
 
@@ -156,7 +163,7 @@
     launchError = null;
 
     try {
-      await invoke("launch_app", { appId: selected.app_id });
+      await invoke("launch_app", { appId: selected.id });
       query = "";
       results = [];
       selectedIndex = -1;
@@ -265,7 +272,7 @@
 
     {#if isExpanded && results.length > 0}
       <ul class="results-list" aria-label="Search results">
-        {#each results as result, index (result.app_id)}
+        {#each results as result, index (result.id)}
           {@const imageSrc = iconImageSrc(result.icon)}
           <li class:selected={index === selectedIndex} class="result-row">
             <span class="app-icon" aria-hidden="true">
