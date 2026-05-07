@@ -9,6 +9,7 @@ use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Size, We
 mod app_discovery;
 mod app_launch;
 mod app_search;
+mod file_actions;
 mod file_index;
 mod file_search;
 mod search_result;
@@ -16,8 +17,11 @@ mod settings;
 
 use app_discovery::AppCatalog;
 use app_launch::LaunchResult;
+use file_actions::ValidatedPath;
 use file_index::FileIndex;
 use search_result::{SearchResult, SearchSource};
+use tauri_plugin_clipboard_manager::ClipboardExt;
+use tauri_plugin_opener::OpenerExt;
 
 type FileIndexState = Arc<RwLock<FileIndex>>;
 
@@ -259,6 +263,85 @@ fn hide_launcher(app: tauri::AppHandle) -> Result<(), String> {
     hide_launcher_for_app(&app)
 }
 
+fn validate_file_action_path(
+    file_index: &FileIndexState,
+    path: &str,
+) -> Result<ValidatedPath, String> {
+    let index = file_index
+        .read()
+        .map_err(|_| "File index unavailable".to_owned())?;
+
+    file_actions::validate_indexed_path(&index, path)
+}
+
+fn path_for_opener(path: &std::path::Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+#[tauri::command]
+fn open_path(
+    app: tauri::AppHandle,
+    file_index: tauri::State<'_, FileIndexState>,
+    path: String,
+) -> Result<(), String> {
+    let validated_path = validate_file_action_path(&file_index, &path)?;
+
+    app.opener()
+        .open_path(path_for_opener(&validated_path.path), None::<&str>)
+        .map_err(|error| {
+            eprintln!(
+                "failed to open path '{}': {error}",
+                validated_path.path.display()
+            );
+            "Could not open item".to_owned()
+        })?;
+
+    hide_launcher_for_app(&app)
+}
+
+#[tauri::command]
+fn reveal_path(
+    app: tauri::AppHandle,
+    file_index: tauri::State<'_, FileIndexState>,
+    path: String,
+) -> Result<(), String> {
+    let validated_path = validate_file_action_path(&file_index, &path)?;
+    let reveal_target = file_actions::reveal_target(&validated_path)?;
+
+    app.opener()
+        .open_path(path_for_opener(&reveal_target), None::<&str>)
+        .map_err(|error| {
+            eprintln!(
+                "failed to reveal path '{}': {error}",
+                reveal_target.display()
+            );
+            "Could not open item".to_owned()
+        })?;
+
+    hide_launcher_for_app(&app)
+}
+
+#[tauri::command]
+fn copy_path(
+    app: tauri::AppHandle,
+    file_index: tauri::State<'_, FileIndexState>,
+    path: String,
+) -> Result<(), String> {
+    let validated_path = validate_file_action_path(&file_index, &path)?;
+
+    app.clipboard()
+        .write_text(path_for_opener(&validated_path.path))
+        .map_err(|error| {
+            eprintln!(
+                "failed to copy path '{}': {error}",
+                validated_path.path.display()
+            );
+            "Could not complete action".to_owned()
+        })?;
+
+    hide_launcher_for_app(&app)
+}
+
 fn start_file_index_scan(file_index: FileIndexState) {
     thread::spawn(move || {
         let roots = file_index::default_index_roots();
@@ -382,11 +465,15 @@ pub fn run() {
     }
 
     builder
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             close_launcher,
+            copy_path,
             hide_launcher,
             launch_app,
+            open_path,
+            reveal_path,
             search,
             set_launcher_expanded
         ])

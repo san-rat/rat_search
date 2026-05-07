@@ -23,8 +23,8 @@
   let results = $state<SearchResult[]>([]);
   let selectedIndex = $state(-1);
   let searchError = $state<string | null>(null);
-  let launchError = $state<string | null>(null);
-  let isLaunching = $state(false);
+  let actionError = $state<string | null>(null);
+  let isRunningAction = $state(false);
   let searchInput: HTMLInputElement;
   let searchRequestId = 0;
   let requestedExpandedState: boolean | null = null;
@@ -45,7 +45,7 @@
       results = [];
       selectedIndex = -1;
       searchError = null;
-      launchError = null;
+      actionError = null;
       isExpanded = false;
 
       if (isTauri()) {
@@ -61,7 +61,7 @@
       results = [];
       selectedIndex = -1;
       searchError = null;
-      launchError = null;
+      actionError = null;
       return;
     }
 
@@ -80,7 +80,7 @@
       results = nextResults;
       selectedIndex = nextResults.length > 0 ? 0 : -1;
       searchError = null;
-      launchError = null;
+      actionError = null;
     } catch (error) {
       if (requestId !== searchRequestId) {
         return;
@@ -90,7 +90,7 @@
       results = [];
       selectedIndex = -1;
       searchError = "Search unavailable";
-      launchError = null;
+      actionError = null;
     }
   }
 
@@ -152,30 +152,42 @@
     return results[selectedIndex];
   }
 
-  async function launchSelectedResult() {
+  async function runSelectedResultAction() {
     const selected = selectedResult();
 
-    if (!selected || selected.action !== "launch_app" || isLaunching || !isTauri()) {
+    if (!selected || isRunningAction || !isTauri()) {
       return;
     }
 
-    isLaunching = true;
-    launchError = null;
+    isRunningAction = true;
+    actionError = null;
 
     try {
-      await invoke("launch_app", { appId: selected.id });
+      if (selected.action === "launch_app") {
+        await invoke("launch_app", { appId: selected.id });
+      } else {
+        if (!selected.path) {
+          actionError = "Could not complete action";
+          focusSearchInput();
+          return;
+        }
+
+        await invoke(selected.action, { path: selected.path });
+      }
+
       query = "";
       results = [];
       selectedIndex = -1;
       searchError = null;
-      launchError = null;
+      actionError = null;
       isExpanded = false;
     } catch (error) {
-      console.error("failed to launch app", error);
-      launchError = "Could not launch app";
+      console.error("failed to run selected action", error);
+      actionError =
+        selected.action === "launch_app" ? "Could not launch app" : "Could not complete action";
       focusSearchInput();
     } finally {
-      isLaunching = false;
+      isRunningAction = false;
     }
   }
 
@@ -212,7 +224,7 @@
     if (event.key === "Escape") {
       event.preventDefault();
       query = "";
-      launchError = null;
+      actionError = null;
 
       if (isTauri()) {
         void invoke("close_launcher").catch((error) => {
@@ -227,28 +239,28 @@
 
     if (event.key === "ArrowDown") {
       event.preventDefault();
-      launchError = null;
+      actionError = null;
       moveSelection(1);
       return;
     }
 
     if (event.key === "ArrowUp") {
       event.preventDefault();
-      launchError = null;
+      actionError = null;
       moveSelection(-1);
       return;
     }
 
     if (event.key === "Tab") {
       event.preventDefault();
-      launchError = null;
+      actionError = null;
       moveSelection(event.shiftKey ? -1 : 1);
       return;
     }
 
     if (event.key === "Enter") {
       event.preventDefault();
-      void launchSelectedResult();
+      void runSelectedResultAction();
     }
   }
 </script>
@@ -295,8 +307,8 @@
       <div class="empty-state">{searchError ?? "No results"}</div>
     {/if}
 
-    {#if isExpanded && launchError}
-      <div class="status-message" role="status">{launchError}</div>
+    {#if isExpanded && actionError}
+      <div class="status-message" role="status">{actionError}</div>
     {/if}
   </section>
 </main>
