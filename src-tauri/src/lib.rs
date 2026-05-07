@@ -15,6 +15,7 @@ mod file_actions;
 mod file_icons;
 mod file_index;
 mod file_search;
+mod search_history;
 mod search_result;
 mod settings;
 mod settings_search;
