@@ -1,15 +1,31 @@
-use std::{thread, time::Duration};
+use std::{
+    sync::{Arc, RwLock},
+    thread,
+    time::Duration,
+};
 
 use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Size, WebviewWindow};
 
 mod app_discovery;
+mod app_icons;
 mod app_launch;
 mod app_search;
+mod file_actions;
+mod file_icons;
+mod file_index;
+mod file_search;
+mod search_result;
 mod settings;
 
 use app_discovery::AppCatalog;
 use app_launch::LaunchResult;
-use app_search::AppSearchResult;
+use file_actions::ValidatedPath;
+use file_index::FileIndex;
+use search_result::{SearchResult, SearchSource};
+use tauri_plugin_clipboard_manager::ClipboardExt;
+use tauri_plugin_opener::OpenerExt;
+
+type FileIndexState = Arc<RwLock<FileIndex>>;
 
 const LAUNCHER_WINDOW_LABEL: &str = "main";
 const LAUNCHER_SHOWN_EVENT: &str = "launcher:shown";
@@ -249,13 +265,167 @@ fn hide_launcher(app: tauri::AppHandle) -> Result<(), String> {
     hide_launcher_for_app(&app)
 }
 
+fn validate_file_action_path(
+    file_index: &FileIndexState,
+    path: &str,
+) -> Result<ValidatedPath, String> {
+    let index = file_index
+        .read()
+        .map_err(|_| "File index unavailable".to_owned())?;
+
+    file_actions::validate_indexed_path(&index, path)
+}
+
+fn path_for_opener(path: &std::path::Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
 #[tauri::command]
-fn search_apps(
+fn open_path(
+    app: tauri::AppHandle,
+    file_index: tauri::State<'_, FileIndexState>,
+    path: String,
+) -> Result<(), String> {
+    let validated_path = validate_file_action_path(&file_index, &path)?;
+
+    app.opener()
+        .open_path(path_for_opener(&validated_path.path), None::<&str>)
+        .map_err(|error| {
+            eprintln!(
+                "failed to open path '{}': {error}",
+                validated_path.path.display()
+            );
+            "Could not open item".to_owned()
+        })?;
+
+    hide_launcher_for_app(&app)
+}
+
+#[tauri::command]
+fn reveal_path(
+    app: tauri::AppHandle,
+    file_index: tauri::State<'_, FileIndexState>,
+    path: String,
+) -> Result<(), String> {
+    let validated_path = validate_file_action_path(&file_index, &path)?;
+    let reveal_target = file_actions::reveal_target(&validated_path)?;
+
+    app.opener()
+        .open_path(path_for_opener(&reveal_target), None::<&str>)
+        .map_err(|error| {
+            eprintln!(
+                "failed to reveal path '{}': {error}",
+                reveal_target.display()
+            );
+            "Could not open item".to_owned()
+        })?;
+
+    hide_launcher_for_app(&app)
+}
+
+#[tauri::command]
+fn copy_path(
+    app: tauri::AppHandle,
+    file_index: tauri::State<'_, FileIndexState>,
+    path: String,
+) -> Result<(), String> {
+    let validated_path = validate_file_action_path(&file_index, &path)?;
+
+    app.clipboard()
+        .write_text(path_for_opener(&validated_path.path))
+        .map_err(|error| {
+            eprintln!(
+                "failed to copy path '{}': {error}",
+                validated_path.path.display()
+            );
+            "Could not complete action".to_owned()
+        })?;
+
+    hide_launcher_for_app(&app)
+}
+
+fn start_file_index_scan(file_index: FileIndexState) {
+    thread::spawn(move || {
+        let roots = file_index::default_index_roots();
+        dev_log(format!(
+            "file index scan: discovered {} default roots",
+            roots.len()
+        ));
+
+        let scanned_index = file_index::scan_roots(&roots);
+        let scanned_count = scanned_index.len();
+
+        match file_index.write() {
+            Ok(mut index) => {
+                *index = scanned_index;
+                dev_log(format!(
+                    "file index scan: stored {scanned_count} file/folder records"
+                ));
+            }
+            Err(error) => {
+                eprintln!("failed to store file index scan results: {error}");
+            }
+        }
+    });
+}
+
+fn search_all(
+    catalog: &AppCatalog,
+    file_index: Option<&FileIndex>,
+    query: &str,
+    limit: usize,
+) -> Vec<SearchResult> {
+    let limit = settings::normalize_result_limit(limit);
+    let mut results = app_search::search_apps(catalog, query, limit);
+
+    if let Some(file_index) = file_index {
+        results.extend(file_search::search_files(file_index, query, limit));
+    }
+
+    results.sort_by(compare_search_results);
+    results.truncate(limit);
+    results
+}
+
+fn compare_search_results(left: &SearchResult, right: &SearchResult) -> std::cmp::Ordering {
+    right
+        .score
+        .cmp(&left.score)
+        .then_with(|| source_priority(&left.source).cmp(&source_priority(&right.source)))
+        .then_with(|| normalize_search_text(&left.title).cmp(&normalize_search_text(&right.title)))
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+fn source_priority(source: &SearchSource) -> u8 {
+    match source {
+        SearchSource::Applications => 0,
+        SearchSource::Folders => 1,
+        SearchSource::Files => 2,
+    }
+}
+
+fn normalize_search_text(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+#[tauri::command]
+fn search(
     catalog: tauri::State<'_, AppCatalog>,
+    file_index: tauri::State<'_, FileIndexState>,
     query: String,
     limit: usize,
-) -> Vec<AppSearchResult> {
-    app_search::search_apps(&catalog, &query, limit)
+) -> Vec<SearchResult> {
+    match file_index.read() {
+        Ok(index) => search_all(&catalog, Some(&index), &query, limit),
+        Err(error) => {
+            eprintln!("failed to read file index for search: {error}");
+            search_all(&catalog, None, &query, limit)
+        }
+    }
 }
 
 #[tauri::command]
@@ -297,12 +467,16 @@ pub fn run() {
     }
 
     builder
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             close_launcher,
+            copy_path,
             hide_launcher,
             launch_app,
-            search_apps,
+            open_path,
+            reveal_path,
+            search,
             set_launcher_expanded
         ])
         .setup(|app| {
@@ -322,6 +496,10 @@ pub fn run() {
             dev_log(format!("discovered {} applications", app_catalog.len()));
             app.manage(app_catalog);
 
+            let file_index = Arc::new(RwLock::new(FileIndex::new()));
+            app.manage(file_index.clone());
+            start_file_index_scan(file_index);
+
             if let Some(window) = app.get_webview_window(LAUNCHER_WINDOW_LABEL) {
                 position_launcher(&window)?;
 
@@ -337,4 +515,107 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::{
+        app_discovery::{AppCatalog, AppRecord},
+        file_index::{FileIndex, FileRecord},
+        search_result::SearchSource,
+    };
+
+    use super::*;
+
+    fn app(id: &str, name: &str) -> AppRecord {
+        AppRecord {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            generic_name: None,
+            comment: None,
+            exec: name.to_lowercase(),
+            icon: None,
+            categories: Vec::new(),
+            keywords: Vec::new(),
+            desktop_file_path: format!("/tmp/{id}"),
+            terminal: false,
+        }
+    }
+
+    fn catalog(apps: Vec<AppRecord>) -> AppCatalog {
+        AppCatalog { apps }
+    }
+
+    fn file(path: &str) -> FileRecord {
+        FileRecord::new(PathBuf::from(path), false, None, Some(10))
+    }
+
+    fn folder(path: &str) -> FileRecord {
+        FileRecord::new(PathBuf::from(path), true, None, None)
+    }
+
+    fn index(records: Vec<FileRecord>) -> FileIndex {
+        FileIndex::from_records(records)
+    }
+
+    #[test]
+    fn mixed_search_keeps_strong_app_above_noisy_file_match() {
+        let app_catalog = catalog(vec![app("report.desktop", "Report")]);
+        let file_index = index(vec![file("/home/sanuk/Documents/Annual Report.pdf")]);
+
+        let results = search_all(&app_catalog, Some(&file_index), "report", 8);
+
+        assert_eq!(results[0].source, SearchSource::Applications);
+        assert_eq!(results[0].title, "Report");
+        assert_eq!(results[1].source, SearchSource::Files);
+    }
+
+    #[test]
+    fn mixed_search_applies_final_limit_after_merging_sources() {
+        let app_catalog = catalog(vec![app("calendar.desktop", "Calendar")]);
+        let file_index = index(vec![
+            file("/home/sanuk/Documents/Report.pdf"),
+            folder("/home/sanuk/Documents/Reports"),
+        ]);
+
+        let results = search_all(&app_catalog, Some(&file_index), "report", 1);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Reports");
+        assert_eq!(results[0].source, SearchSource::Folders);
+    }
+
+    #[test]
+    fn mixed_search_ties_sort_by_source_then_title_then_id() {
+        let app_catalog = AppCatalog::default();
+        let first_file = file("/home/sanuk/Documents/Alpha");
+        let folder = folder("/home/sanuk/Documents/Alpha");
+        let second_file = file("/home/sanuk/Documents/Beta");
+        let file_index = index(vec![second_file, first_file, folder]);
+
+        let results = search_all(&app_catalog, Some(&file_index), "alpha", 8);
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| (result.source.clone(), result.title.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (SearchSource::Folders, "Alpha"),
+                (SearchSource::Files, "Alpha")
+            ]
+        );
+    }
+
+    #[test]
+    fn mixed_search_falls_back_to_apps_without_file_index() {
+        let app_catalog = catalog(vec![app("settings.desktop", "Settings")]);
+
+        let results = search_all(&app_catalog, None, "settings", 8);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source, SearchSource::Applications);
+    }
 }

@@ -1,7 +1,6 @@
-use serde::Serialize;
-
 use crate::{
     app_discovery::{AppCatalog, AppRecord},
+    search_result::{SearchAction, SearchMetadata, SearchResult, SearchSource},
     settings,
 };
 
@@ -14,18 +13,9 @@ const ABBREVIATION_SCORE: i32 = 420;
 const SUBSEQUENCE_SCORE: i32 = 260;
 const SHORT_NAME_BONUS_LIMIT: i32 = 50;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct AppSearchResult {
-    pub(crate) app_id: String,
-    pub(crate) title: String,
-    pub(crate) subtitle: Option<String>,
-    pub(crate) icon: Option<String>,
-    pub(crate) terminal: bool,
-}
-
-pub(crate) fn search_apps(catalog: &AppCatalog, query: &str, limit: usize) -> Vec<AppSearchResult> {
+pub(crate) fn search_apps(catalog: &AppCatalog, query: &str, limit: usize) -> Vec<SearchResult> {
     let query = normalize(query);
-    let limit = normalize_limit(limit);
+    let limit = settings::normalize_result_limit(limit);
 
     if query.is_empty() {
         let mut apps = catalog.apps.iter().collect::<Vec<_>>();
@@ -34,7 +24,7 @@ pub(crate) fn search_apps(catalog: &AppCatalog, query: &str, limit: usize) -> Ve
         return apps
             .into_iter()
             .take(limit)
-            .map(AppSearchResult::from)
+            .map(|app| search_result_from_app(app, 0))
             .collect();
     }
 
@@ -56,15 +46,8 @@ pub(crate) fn search_apps(catalog: &AppCatalog, query: &str, limit: usize) -> Ve
     matches
         .into_iter()
         .take(limit)
-        .map(|(app, _score)| AppSearchResult::from(app))
+        .map(|(app, score)| search_result_from_app(app, score))
         .collect()
-}
-
-fn normalize_limit(limit: usize) -> usize {
-    match limit {
-        0 => settings::DEFAULT_MAX_RESULTS,
-        limit => limit.min(settings::RESULT_LIMIT_CAP),
-    }
 }
 
 fn score_app(app: &AppRecord, query: &str) -> i32 {
@@ -171,19 +154,24 @@ fn normalize(value: &str) -> String {
         .to_lowercase()
 }
 
-impl From<&AppRecord> for AppSearchResult {
-    fn from(app: &AppRecord) -> Self {
-        Self {
+fn search_result_from_app(app: &AppRecord, score: i32) -> SearchResult {
+    SearchResult {
+        id: app.id.clone(),
+        title: app.name.clone(),
+        subtitle: app
+            .comment
+            .clone()
+            .or_else(|| app.generic_name.clone())
+            .or_else(|| app.categories.first().cloned()),
+        icon: app.icon.clone(),
+        source: SearchSource::Applications,
+        action: SearchAction::LaunchApp,
+        path: None,
+        score,
+        metadata: Some(SearchMetadata::Application {
             app_id: app.id.clone(),
-            title: app.name.clone(),
-            subtitle: app
-                .comment
-                .clone()
-                .or_else(|| app.generic_name.clone())
-                .or_else(|| app.categories.first().cloned()),
-            icon: app.icon.clone(),
             terminal: app.terminal,
-        }
+        }),
     }
 }
 
@@ -265,7 +253,41 @@ mod tests {
         );
 
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].app_id, "firefox.desktop");
+        assert_eq!(results[0].id, "firefox.desktop");
+    }
+
+    #[test]
+    fn app_results_use_shared_result_shape() {
+        let mut firefox = app("firefox.desktop", "Firefox");
+        firefox.comment = Some("Browse the web".to_owned());
+        firefox.icon = Some("firefox".to_owned());
+        firefox.terminal = true;
+
+        let results = search_apps(&catalog(vec![firefox]), "fire", 8);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "firefox.desktop");
+        assert_eq!(results[0].title, "Firefox");
+        assert_eq!(results[0].subtitle.as_deref(), Some("Browse the web"));
+        assert_eq!(results[0].icon.as_deref(), Some("firefox"));
+        assert_eq!(results[0].source, SearchSource::Applications);
+        assert_eq!(results[0].action, SearchAction::LaunchApp);
+        assert_eq!(results[0].path, None);
+        assert_eq!(results[0].score, NAME_PREFIX_SCORE + 43);
+        assert_eq!(
+            results[0].metadata.as_ref(),
+            Some(&SearchMetadata::Application {
+                app_id: "firefox.desktop".to_owned(),
+                terminal: true,
+            })
+        );
+    }
+
+    #[test]
+    fn empty_query_app_results_use_zero_score() {
+        let results = search_apps(&catalog(vec![app("firefox.desktop", "Firefox")]), "", 8);
+
+        assert_eq!(results[0].score, 0);
     }
 
     #[test]
@@ -279,7 +301,7 @@ mod tests {
             8,
         );
 
-        assert_eq!(results[0].app_id, "terminal.desktop");
+        assert_eq!(results[0].id, "terminal.desktop");
     }
 
     #[test]
@@ -293,7 +315,7 @@ mod tests {
             8,
         );
 
-        assert_eq!(results[0].app_id, "firefox.desktop");
+        assert_eq!(results[0].id, "firefox.desktop");
     }
 
     #[test]
@@ -307,7 +329,7 @@ mod tests {
         let results = search_apps(&catalog(vec![browser, settings]), "utility", 8);
 
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].app_id, "settings.desktop");
+        assert_eq!(results[0].id, "settings.desktop");
     }
 
     #[test]
@@ -324,7 +346,7 @@ mod tests {
             8,
         );
 
-        assert_eq!(results[0].app_id, "settings.desktop");
+        assert_eq!(results[0].id, "settings.desktop");
     }
 
     #[test]
@@ -338,8 +360,8 @@ mod tests {
         let generic_results = search_apps(&catalog(vec![terminal.clone()]), "emulator", 8);
         let comment_results = search_apps(&catalog(vec![browser]), "internet", 8);
 
-        assert_eq!(generic_results[0].app_id, "terminal.desktop");
-        assert_eq!(comment_results[0].app_id, "browser.desktop");
+        assert_eq!(generic_results[0].id, "terminal.desktop");
+        assert_eq!(comment_results[0].id, "browser.desktop");
     }
 
     #[test]
@@ -353,14 +375,14 @@ mod tests {
             8,
         );
 
-        assert_eq!(results[0].app_id, "tool.desktop");
+        assert_eq!(results[0].id, "tool.desktop");
     }
 
     #[test]
     fn abbreviation_match_can_find_firefox() {
         let results = search_apps(&catalog(vec![app("firefox.desktop", "Firefox")]), "ff", 8);
 
-        assert_eq!(results[0].app_id, "firefox.desktop");
+        assert_eq!(results[0].id, "firefox.desktop");
     }
 
     #[test]
@@ -371,7 +393,7 @@ mod tests {
             8,
         );
 
-        assert_eq!(results[0].app_id, "settings.desktop");
+        assert_eq!(results[0].id, "settings.desktop");
     }
 
     #[test]
@@ -397,7 +419,7 @@ mod tests {
         assert_eq!(
             results
                 .iter()
-                .map(|result| result.app_id.as_str())
+                .map(|result| result.id.as_str())
                 .collect::<Vec<_>>(),
             ["bravo.desktop", "alpha.desktop", "zed.desktop"]
         );
@@ -425,7 +447,7 @@ mod tests {
 
         let subtitles = results
             .into_iter()
-            .map(|result| (result.app_id, result.subtitle))
+            .map(|result| (result.id, result.subtitle))
             .collect::<Vec<_>>();
 
         assert_eq!(
