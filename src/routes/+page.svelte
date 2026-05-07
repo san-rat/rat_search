@@ -41,6 +41,8 @@
   let query = $state("");
   let isExpanded = $state(false);
   let isCollapsing = $state(false);
+  let isVisuallyCompact = $state(true);
+  let hasExpandedThisSession = $state(false);
   let results = $state<SearchResult[]>([]);
   let selectedIndex = $state(-1);
   let searchError = $state<string | null>(null);
@@ -82,15 +84,11 @@
     }
   }
 
-  function collapseToCompactNow() {
+  function collapseToVisualCompactNow() {
     clearCollapseTimer();
     clearResultState();
-    isExpanded = false;
     isCollapsing = false;
-
-    if (isTauri()) {
-      void setNativeExpanded(false);
-    }
+    isVisuallyCompact = true;
   }
 
   function cancelPendingCollapse() {
@@ -99,8 +97,13 @@
   }
 
   function startCollapseToCompact() {
-    if (!isExpanded || prefersReducedMotion()) {
-      collapseToCompactNow();
+    if (isVisuallyCompact && !isCollapsing) {
+      clearResultState();
+      return;
+    }
+
+    if (prefersReducedMotion()) {
+      collapseToVisualCompactNow();
       return;
     }
 
@@ -110,8 +113,29 @@
     isCollapsing = true;
 
     collapseTimer = setTimeout(() => {
-      collapseToCompactNow();
+      collapseToVisualCompactNow();
     }, COLLAPSE_TRANSITION_MS);
+  }
+
+  function useExpandedChrome() {
+    return hasExpandedThisSession && !isVisuallyCompact;
+  }
+
+  function resetVisualSessionState() {
+    clearCollapseTimer();
+    clearResultState();
+    isExpanded = false;
+    isCollapsing = false;
+    isVisuallyCompact = true;
+    hasExpandedThisSession = false;
+  }
+
+  async function resetToNativeCompact() {
+    resetVisualSessionState();
+
+    if (isTauri()) {
+      await setNativeExpanded(false);
+    }
   }
 
   async function loadResults(searchQuery: string) {
@@ -125,6 +149,8 @@
 
     cancelPendingCollapse();
     isExpanded = true;
+    isVisuallyCompact = false;
+    hasExpandedThisSession = true;
 
     if (!isTauri()) {
       results = [];
@@ -381,7 +407,7 @@
       selectedIndex = -1;
       searchError = null;
       actionError = null;
-      isExpanded = false;
+      await resetToNativeCompact();
     } catch (error) {
       console.error("failed to run selected action", error);
       actionError = actionFailureMessage(action);
@@ -401,7 +427,12 @@
     let disposed = false;
     let unlisten: UnlistenFn | undefined;
 
-    void listen("launcher:shown", focusSearchInput)
+    void listen("launcher:shown", () => {
+      query = "";
+      resetVisualSessionState();
+      requestedExpandedState = false;
+      focusSearchInput();
+    })
       .then((unlistenListener) => {
         if (disposed) {
           unlistenListener();
@@ -428,9 +459,11 @@
       actionError = null;
 
       if (isTauri()) {
-        void invoke("close_launcher").catch((error) => {
-          console.error("failed to close launcher", error);
-        });
+        void invoke("close_launcher")
+          .then(() => resetToNativeCompact())
+          .catch((error) => {
+            console.error("failed to close launcher", error);
+          });
         return;
       }
 
@@ -487,7 +520,12 @@
 </script>
 
 <main class="launcher-shell">
-  <section class:expanded={isExpanded} class="command-palette" aria-label="Rat Search">
+  <section
+    class:expanded={useExpandedChrome()}
+    class:visually-compact={isVisuallyCompact}
+    class="command-palette"
+    aria-label="Rat Search"
+  >
     <div class="spotlight-bar">
       <span class="search-icon" aria-hidden="true"></span>
       <input
@@ -503,7 +541,7 @@
       />
     </div>
 
-    {#if isExpanded}
+    {#if isExpanded && !isVisuallyCompact}
       <div class:collapsing={isCollapsing} class="results-region">
         {#if results.length > 0}
           <ul class="results-list" aria-label="Search results">
@@ -522,10 +560,12 @@
                   {/if}
                 </span>
                 <span class="result-copy">
-                  <span class="result-title">{result.title}</span>
+                  <span class="result-title-row">
+                    <span class="result-title">{result.title}</span>
+                    <span class="result-source">{sourceLabel(result.source)}</span>
+                  </span>
                   <span class="result-subtitle">{subtitle}</span>
                 </span>
-                <span class="result-source">{sourceLabel(result.source)}</span>
               </li>
             {/each}
           </ul>
@@ -535,7 +575,7 @@
       </div>
     {/if}
 
-    {#if isExpanded && actionError}
+    {#if isExpanded && !isVisuallyCompact && actionError}
       <div class="status-message" role="status">{actionError}</div>
     {/if}
   </section>
@@ -600,7 +640,8 @@
     max-width: 100vw;
     max-height: 100vh;
     display: grid;
-    place-items: center;
+    align-items: start;
+    justify-items: center;
     padding: 4px;
     box-sizing: border-box;
     overflow: hidden !important;
@@ -617,9 +658,6 @@
     height: 100%;
     max-width: 100%;
     max-height: 100%;
-    display: grid;
-    grid-template-rows: minmax(0, 1fr);
-    gap: 0;
     padding: 4px;
     overflow: hidden !important;
     border: 1px solid rgba(255, 255, 255, 0.64);
@@ -629,21 +667,24 @@
       0 8px 22px rgba(0, 0, 0, 0.14),
       0 2px 8px rgba(0, 0, 0, 0.1),
       inset 0 1px 0 rgba(255, 255, 255, 0.7);
+    transition: height 120ms ease-out;
     -ms-overflow-style: none;
     overscroll-behavior: none;
     backdrop-filter: blur(18px) saturate(1.35);
     -webkit-backdrop-filter: blur(18px) saturate(1.35);
   }
 
-  .command-palette.expanded {
-    grid-template-rows: 60px minmax(0, 1fr);
-    gap: 6px;
+  .command-palette.visually-compact {
+    height: 68px;
   }
 
   .spotlight-bar {
-    width: 100%;
+    position: absolute;
+    z-index: 2;
+    top: 4px;
+    right: 4px;
+    left: 4px;
     height: 60px;
-    max-width: 100%;
     min-height: 60px;
     max-height: 60px;
     box-sizing: border-box;
@@ -709,9 +750,12 @@
   }
 
   .results-region {
+    position: absolute;
+    top: 70px;
+    right: 4px;
+    bottom: 4px;
+    left: 4px;
     min-height: 0;
-    width: 100%;
-    height: 100%;
     overflow: hidden !important;
   }
 
@@ -751,7 +795,7 @@
     width: 100%;
     height: 42px;
     display: grid;
-    grid-template-columns: 34px minmax(0, 1fr) 52px;
+    grid-template-columns: 34px minmax(0, 1fr);
     align-items: center;
     gap: 12px;
     padding: 0 12px 0 10px;
@@ -906,6 +950,14 @@
     overflow: hidden;
   }
 
+  .result-title-row {
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    overflow: hidden;
+  }
+
   .result-title,
   .result-subtitle,
   .result-source {
@@ -922,13 +974,13 @@
   }
 
   .result-source {
-    width: 44px;
-    justify-self: end;
+    flex: 0 0 auto;
+    max-width: 52px;
     padding: 2px 6px;
     border-radius: 6px;
     background: rgba(58, 60, 67, 0.1);
     color: rgba(58, 60, 67, 0.62);
-    font-size: 10px;
+    font-size: 9px;
     font-weight: 700;
     line-height: 1;
     text-align: center;
@@ -993,6 +1045,10 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
+    .command-palette {
+      transition: none;
+    }
+
     .results-region > .results-list,
     .results-region > .empty-state,
     .results-region.collapsing > .results-list,
