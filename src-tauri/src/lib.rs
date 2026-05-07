@@ -1,4 +1,8 @@
-use std::{thread, time::Duration};
+use std::{
+    sync::{Arc, RwLock},
+    thread,
+    time::Duration,
+};
 
 use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Size, WebviewWindow};
 
@@ -11,7 +15,10 @@ mod settings;
 
 use app_discovery::AppCatalog;
 use app_launch::LaunchResult;
+use file_index::FileIndex;
 use search_result::SearchResult;
+
+type FileIndexState = Arc<RwLock<FileIndex>>;
 
 const LAUNCHER_WINDOW_LABEL: &str = "main";
 const LAUNCHER_SHOWN_EVENT: &str = "launcher:shown";
@@ -251,6 +258,31 @@ fn hide_launcher(app: tauri::AppHandle) -> Result<(), String> {
     hide_launcher_for_app(&app)
 }
 
+fn start_file_index_scan(file_index: FileIndexState) {
+    thread::spawn(move || {
+        let roots = file_index::default_index_roots();
+        dev_log(format!(
+            "file index scan: discovered {} default roots",
+            roots.len()
+        ));
+
+        let scanned_index = file_index::scan_roots(&roots);
+        let scanned_count = scanned_index.len();
+
+        match file_index.write() {
+            Ok(mut index) => {
+                *index = scanned_index;
+                dev_log(format!(
+                    "file index scan: stored {scanned_count} file/folder records"
+                ));
+            }
+            Err(error) => {
+                eprintln!("failed to store file index scan results: {error}");
+            }
+        }
+    });
+}
+
 #[tauri::command]
 fn search(catalog: tauri::State<'_, AppCatalog>, query: String, limit: usize) -> Vec<SearchResult> {
     app_search::search_apps(&catalog, &query, limit)
@@ -319,6 +351,10 @@ pub fn run() {
             ));
             dev_log(format!("discovered {} applications", app_catalog.len()));
             app.manage(app_catalog);
+
+            let file_index = Arc::new(RwLock::new(FileIndex::new()));
+            app.manage(file_index.clone());
+            start_file_index_scan(file_index);
 
             if let Some(window) = app.get_webview_window(LAUNCHER_WINDOW_LABEL) {
                 position_launcher(&window)?;

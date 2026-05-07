@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::{
-    env,
+    env, fs,
     path::{Path, PathBuf},
     time::SystemTime,
 };
@@ -45,6 +45,73 @@ pub(crate) fn default_index_roots_from_home(home: &Path) -> Vec<PathBuf> {
 
 pub(crate) fn should_skip_directory_name(name: &str) -> bool {
     name.starts_with('.') || GENERATED_OR_HEAVY_DIRECTORY_NAMES.contains(&name)
+}
+
+pub(crate) fn scan_default_roots() -> FileIndex {
+    scan_roots(&default_index_roots())
+}
+
+pub(crate) fn scan_roots(roots: &[PathBuf]) -> FileIndex {
+    let mut records = Vec::new();
+
+    for root in roots {
+        scan_path(root, &mut records);
+    }
+
+    FileIndex::from_records(records)
+}
+
+fn scan_path(path: &Path, records: &mut Vec<FileRecord>) {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+
+    if metadata.file_type().is_symlink() {
+        return;
+    }
+
+    let is_dir = metadata.is_dir();
+    let size = (!is_dir).then_some(metadata.len());
+    records.push(FileRecord::new(
+        path.to_path_buf(),
+        is_dir,
+        metadata.modified().ok(),
+        size,
+    ));
+
+    if !is_dir {
+        return;
+    }
+
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    let mut child_paths = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    child_paths.sort();
+
+    for child_path in child_paths {
+        if should_skip_directory(&child_path) {
+            continue;
+        }
+
+        scan_path(&child_path, records);
+    }
+}
+
+fn should_skip_directory(path: &Path) -> bool {
+    if !fs::symlink_metadata(path)
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(should_skip_directory_name)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +180,10 @@ impl FileIndex {
 
     pub(crate) fn extend(&mut self, records: impl IntoIterator<Item = FileRecord>) {
         self.records.extend(records);
+    }
+
+    pub(crate) fn replace_records(&mut self, records: Vec<FileRecord>) {
+        self.records = records;
     }
 
     pub(crate) fn records(&self) -> &[FileRecord] {
@@ -220,6 +291,23 @@ mod tests {
     }
 
     #[test]
+    fn index_records_can_be_replaced() {
+        let original =
+            FileRecord::new(PathBuf::from("/home/sanuk/original.txt"), false, None, None);
+        let replacement = FileRecord::new(
+            PathBuf::from("/home/sanuk/replacement.txt"),
+            false,
+            None,
+            None,
+        );
+        let mut index = FileIndex::from_records(vec![original]);
+
+        index.replace_records(vec![replacement.clone()]);
+
+        assert_eq!(index.records(), &[replacement]);
+    }
+
+    #[test]
     fn default_roots_include_only_existing_directories_in_stable_order() {
         let home = temporary_home("ordered-roots");
         fs::create_dir(home.join("Pictures")).expect("Pictures should be created");
@@ -279,5 +367,143 @@ mod tests {
                 "{name} should not be skipped"
             );
         }
+    }
+
+    #[test]
+    fn scan_includes_roots_nested_folders_and_files() {
+        let home = temporary_home("scan-contents");
+        let root = home.join("Documents");
+        let nested = root.join("Projects");
+        let file = nested.join("Notes.TXT");
+        fs::create_dir_all(&nested).expect("nested directory should be created");
+        fs::write(&file, "hello").expect("file should be created");
+
+        let index = scan_roots(std::slice::from_ref(&root));
+        let paths = index
+            .records()
+            .iter()
+            .map(|record| record.path.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths, [root.clone(), nested.clone(), file.clone()]);
+
+        fs::remove_dir_all(home).expect("temporary home should be removed");
+    }
+
+    #[test]
+    fn scan_skips_missing_roots_quietly() {
+        let home = temporary_home("scan-missing");
+        let missing = home.join("Documents");
+
+        let index = scan_roots(&[missing]);
+
+        assert!(index.is_empty());
+
+        fs::remove_dir_all(home).expect("temporary home should be removed");
+    }
+
+    #[test]
+    fn scan_skips_hidden_and_heavy_directories_but_keeps_similarly_named_files() {
+        let home = temporary_home("scan-skips");
+        let root = home.join("Documents");
+        fs::create_dir_all(root.join(".hidden")).expect("hidden directory should be created");
+        fs::create_dir_all(root.join("node_modules")).expect("heavy directory should be created");
+        fs::write(root.join(".hidden/secret.txt"), "secret")
+            .expect("hidden file should be created");
+        fs::write(root.join("node_modules/package.json"), "{}")
+            .expect("package file should be created");
+        fs::write(root.join("build"), "not a directory").expect("build file should be created");
+
+        let index = scan_roots(std::slice::from_ref(&root));
+        let names = index
+            .records()
+            .iter()
+            .map(|record| record.file_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["Documents", "build"]);
+
+        fs::remove_dir_all(home).expect("temporary home should be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_skips_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let home = temporary_home("scan-symlink");
+        let root = home.join("Documents");
+        let target = root.join("target.txt");
+        let link = root.join("target-link.txt");
+        fs::create_dir_all(&root).expect("root directory should be created");
+        fs::write(&target, "target").expect("target file should be created");
+        symlink(&target, &link).expect("symlink should be created");
+
+        let index = scan_roots(std::slice::from_ref(&root));
+        let paths = index
+            .records()
+            .iter()
+            .map(|record| record.path.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths, [root.clone(), target.clone()]);
+
+        fs::remove_dir_all(home).expect("temporary home should be removed");
+    }
+
+    #[test]
+    fn scan_populates_file_and_folder_metadata() {
+        let home = temporary_home("scan-metadata");
+        let root = home.join("Documents");
+        let file = root.join("Report.PDF");
+        fs::create_dir_all(&root).expect("root directory should be created");
+        fs::write(&file, "report").expect("file should be created");
+
+        let index = scan_roots(std::slice::from_ref(&root));
+        let root_record = index
+            .records()
+            .iter()
+            .find(|record| record.path == root)
+            .expect("root record should exist");
+        let file_record = index
+            .records()
+            .iter()
+            .find(|record| record.path == file)
+            .expect("file record should exist");
+
+        assert!(root_record.is_dir);
+        assert_eq!(root_record.size, None);
+        assert!(root_record.modified_time.is_some());
+        assert!(!file_record.is_dir);
+        assert_eq!(file_record.size, Some(6));
+        assert_eq!(file_record.extension.as_deref(), Some("pdf"));
+        assert!(file_record.modified_time.is_some());
+
+        fs::remove_dir_all(home).expect("temporary home should be removed");
+    }
+
+    #[test]
+    fn scan_order_is_deterministic_by_path() {
+        let home = temporary_home("scan-order");
+        let root = home.join("Documents");
+        fs::create_dir_all(&root).expect("root directory should be created");
+        fs::write(root.join("zeta.txt"), "").expect("zeta should be created");
+        fs::write(root.join("alpha.txt"), "").expect("alpha should be created");
+        fs::create_dir(root.join("middle")).expect("middle directory should be created");
+        fs::write(root.join("middle/beta.txt"), "").expect("beta should be created");
+
+        let index = scan_roots(std::slice::from_ref(&root));
+        let names = index
+            .records()
+            .iter()
+            .map(|record| record.file_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            ["Documents", "alpha.txt", "middle", "beta.txt", "zeta.txt"]
+        );
+
+        fs::remove_dir_all(home).expect("temporary home should be removed");
     }
 }
