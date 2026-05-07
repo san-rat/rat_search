@@ -6,6 +6,8 @@ pub(crate) const LAUNCHER_COMPACT_HEIGHT: u32 = 76;
 pub(crate) const LAUNCHER_EXPANDED_HEIGHT: u32 = 460;
 pub(crate) const DEFAULT_THEME: &str = "system";
 pub(crate) const DEFAULT_SEARCH_SOURCE: &str = "applications only";
+pub(crate) const DEFAULT_INDEX_ROOT_NAMES: [&str; 4] =
+    ["Desktop", "Documents", "Downloads", "Pictures"];
 
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub(crate) const DEFAULT_HOTKEY_MODIFIERS: tauri_plugin_global_shortcut::Modifiers =

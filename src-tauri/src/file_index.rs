@@ -1,9 +1,51 @@
 #![allow(dead_code)]
 
 use std::{
+    env,
     path::{Path, PathBuf},
     time::SystemTime,
 };
+
+use crate::settings;
+
+const GENERATED_OR_HEAVY_DIRECTORY_NAMES: &[&str] = &[
+    "node_modules",
+    ".git",
+    "target",
+    "build",
+    "dist",
+    ".cache",
+    "tmp",
+    "temp",
+];
+
+pub(crate) fn default_index_roots() -> Vec<PathBuf> {
+    let Ok(home) = env::var("HOME") else {
+        return Vec::new();
+    };
+
+    if home.trim().is_empty() {
+        return Vec::new();
+    }
+
+    default_index_roots_from_home(Path::new(&home))
+}
+
+pub(crate) fn default_index_roots_from_home(home: &Path) -> Vec<PathBuf> {
+    if home.as_os_str().is_empty() {
+        return Vec::new();
+    }
+
+    settings::DEFAULT_INDEX_ROOT_NAMES
+        .iter()
+        .map(|root_name| home.join(root_name))
+        .filter(|path| path.is_dir())
+        .collect()
+}
+
+pub(crate) fn should_skip_directory_name(name: &str) -> bool {
+    name.starts_with('.') || GENERATED_OR_HEAVY_DIRECTORY_NAMES.contains(&name)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FileRecord {
@@ -88,7 +130,22 @@ impl FileIndex {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
+
+    fn temporary_home(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system time should be after Unix epoch")
+            .as_nanos();
+        let path =
+            env::temp_dir().join(format!("rat-search-{name}-{}-{unique}", std::process::id()));
+
+        fs::create_dir_all(&path).expect("temporary home should be created");
+
+        path
+    }
 
     #[test]
     fn file_record_derives_file_metadata_from_path() {
@@ -160,5 +217,67 @@ mod tests {
         let index = FileIndex::from_records(vec![record.clone()]);
 
         assert_eq!(index.records(), &[record]);
+    }
+
+    #[test]
+    fn default_roots_include_only_existing_directories_in_stable_order() {
+        let home = temporary_home("ordered-roots");
+        fs::create_dir(home.join("Pictures")).expect("Pictures should be created");
+        fs::create_dir(home.join("Desktop")).expect("Desktop should be created");
+        fs::create_dir(home.join("Documents")).expect("Documents should be created");
+        fs::write(home.join("Downloads"), "").expect("Downloads file should be created");
+
+        let roots = default_index_roots_from_home(&home);
+
+        assert_eq!(
+            roots,
+            [
+                home.join("Desktop"),
+                home.join("Documents"),
+                home.join("Pictures")
+            ]
+        );
+
+        fs::remove_dir_all(home).expect("temporary home should be removed");
+    }
+
+    #[test]
+    fn missing_default_roots_are_skipped_quietly() {
+        let home = temporary_home("missing-roots");
+
+        let roots = default_index_roots_from_home(&home);
+
+        assert!(roots.is_empty());
+
+        fs::remove_dir_all(home).expect("temporary home should be removed");
+    }
+
+    #[test]
+    fn empty_home_path_returns_no_roots() {
+        assert!(default_index_roots_from_home(Path::new("")).is_empty());
+    }
+
+    #[test]
+    fn directory_name_exclusion_identifies_hidden_and_heavy_directories() {
+        for name in [
+            ".hidden",
+            ".git",
+            ".cache",
+            "node_modules",
+            "target",
+            "build",
+            "dist",
+            "tmp",
+            "temp",
+        ] {
+            assert!(should_skip_directory_name(name), "{name} should be skipped");
+        }
+
+        for name in ["Desktop", "Documents", "src", "photos"] {
+            assert!(
+                !should_skip_directory_name(name),
+                "{name} should not be skipped"
+            );
+        }
     }
 }
