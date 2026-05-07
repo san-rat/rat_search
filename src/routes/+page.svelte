@@ -469,12 +469,10 @@
               {/if}
             </span>
             <span class="result-copy">
-              <span class="result-title-row">
-                <span class="result-title">{result.title}</span>
-                <span class="result-source">{sourceLabel(result.source)}</span>
-              </span>
+              <span class="result-title">{result.title}</span>
               <span class="result-subtitle">{subtitle}</span>
             </span>
+            <span class="result-source">{sourceLabel(result.source)}</span>
           </li>
         {/each}
       </ul>
@@ -675,7 +673,7 @@
     width: 100%;
     height: 42px;
     display: grid;
-    grid-template-columns: 34px minmax(0, 1fr);
+    grid-template-columns: 34px minmax(0, 1fr) 52px;
     align-items: center;
     gap: 12px;
     padding: 0 12px 0 10px;
@@ -830,15 +828,6 @@
     overflow: hidden;
   }
 
-  .result-title-row {
-    min-width: 0;
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    align-items: center;
-    gap: 8px;
-    overflow: hidden;
-  }
-
   .result-title,
   .result-subtitle,
   .result-source {
@@ -855,7 +844,8 @@
   }
 
   .result-source {
-    max-width: 58px;
+    width: 44px;
+    justify-self: end;
     padding: 2px 6px;
     border-radius: 6px;
     background: rgba(58, 60, 67, 0.1);
@@ -863,6 +853,7 @@
     font-size: 10px;
     font-weight: 700;
     line-height: 1;
+    text-align: center;
     text-transform: uppercase;
   }
 
