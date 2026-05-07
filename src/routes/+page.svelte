@@ -5,6 +5,8 @@
 
   type SearchSource = "applications" | "files" | "folders";
   type SearchAction = "launch_app" | "open_path" | "reveal_path" | "copy_path";
+  type PathAction = Exclude<SearchAction, "launch_app">;
+  type ShortcutAction = Extract<SearchAction, "reveal_path" | "copy_path">;
 
   type ApplicationMetadata = {
     kind: "application";
@@ -255,27 +257,73 @@
     return results[selectedIndex];
   }
 
-  async function runSelectedResultAction() {
+  function isFileSystemResult(result: SearchResult) {
+    return result.source === "files" || result.source === "folders";
+  }
+
+  function isPathAction(action: SearchAction): action is PathAction {
+    return action !== "launch_app";
+  }
+
+  function selectedResultCanRunShortcut(action: ShortcutAction) {
+    const selected = selectedResult();
+
+    return Boolean(
+      selected &&
+        isFileSystemResult(selected) &&
+        selected.path &&
+        !isRunningAction &&
+        (action === "reveal_path" || action === "copy_path"),
+    );
+  }
+
+  function searchInputHasSelection() {
+    return (
+      searchInput?.selectionStart !== null &&
+      searchInput?.selectionEnd !== null &&
+      searchInput?.selectionStart !== searchInput?.selectionEnd
+    );
+  }
+
+  function actionFailureMessage(action: SearchAction) {
+    if (action === "launch_app") {
+      return "Could not launch app";
+    }
+
+    if (action === "copy_path") {
+      return "Could not complete action";
+    }
+
+    return "Could not open item";
+  }
+
+  async function runSelectedResultAction(actionOverride?: ShortcutAction) {
     const selected = selectedResult();
 
     if (!selected || isRunningAction || !isTauri()) {
       return;
     }
 
+    if (actionOverride && !isFileSystemResult(selected)) {
+      return;
+    }
+
+    const action = actionOverride ?? selected.action;
+
     isRunningAction = true;
     actionError = null;
 
     try {
-      if (selected.action === "launch_app") {
+      if (action === "launch_app") {
         await invoke("launch_app", { appId: selected.id });
-      } else {
-        if (!selected.path) {
-          actionError = "Could not complete action";
+      } else if (isPathAction(action)) {
+        if (!selected.path || !isFileSystemResult(selected)) {
+          actionError = actionFailureMessage(action);
           focusSearchInput();
           return;
         }
 
-        await invoke(selected.action, { path: selected.path });
+        await invoke(action, { path: selected.path });
       }
 
       query = "";
@@ -286,8 +334,7 @@
       isExpanded = false;
     } catch (error) {
       console.error("failed to run selected action", error);
-      actionError =
-        selected.action === "launch_app" ? "Could not launch app" : "Could not complete action";
+      actionError = actionFailureMessage(action);
       focusSearchInput();
     } finally {
       isRunningAction = false;
@@ -358,6 +405,26 @@
       event.preventDefault();
       actionError = null;
       moveSelection(event.shiftKey ? -1 : 1);
+      return;
+    }
+
+    if (event.ctrlKey && event.key === "Enter") {
+      if (selectedResultCanRunShortcut("reveal_path")) {
+        event.preventDefault();
+        actionError = null;
+        void runSelectedResultAction("reveal_path");
+      }
+
+      return;
+    }
+
+    if (event.ctrlKey && event.key.toLowerCase() === "c") {
+      if (!searchInputHasSelection() && selectedResultCanRunShortcut("copy_path")) {
+        event.preventDefault();
+        actionError = null;
+        void runSelectedResultAction("copy_path");
+      }
+
       return;
     }
 
