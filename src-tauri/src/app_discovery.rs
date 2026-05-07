@@ -4,6 +4,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::app_icons::AppIconResolver;
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AppRecord {
@@ -28,9 +30,10 @@ pub(crate) struct AppCatalog {
 impl AppCatalog {
     pub(crate) fn scan() -> Self {
         let mut records_by_id = HashMap::new();
+        let icon_resolver = AppIconResolver::new();
 
         for directory in application_directories() {
-            scan_application_directory(&directory, &mut records_by_id);
+            scan_application_directory(&directory, &mut records_by_id, &icon_resolver);
         }
 
         let mut apps = records_by_id.into_values().collect::<Vec<_>>();
@@ -66,7 +69,11 @@ fn application_directories() -> Vec<PathBuf> {
     directories
 }
 
-fn scan_application_directory(directory: &Path, records_by_id: &mut HashMap<String, AppRecord>) {
+fn scan_application_directory(
+    directory: &Path,
+    records_by_id: &mut HashMap<String, AppRecord>,
+    icon_resolver: &AppIconResolver,
+) {
     let Ok(entries) = fs::read_dir(directory) else {
         return;
     };
@@ -81,10 +88,11 @@ fn scan_application_directory(directory: &Path, records_by_id: &mut HashMap<Stri
             continue;
         }
 
-        let Some(record) = parse_desktop_file(&path) else {
+        let Some(mut record) = parse_desktop_file(&path) else {
             continue;
         };
 
+        record.icon = Some(icon_resolver.resolve(record.icon.as_deref()));
         records_by_id.insert(record.id.clone(), record);
     }
 }
@@ -187,10 +195,31 @@ fn parse_list(value: Option<&String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
     use super::*;
 
     fn parse(contents: &str) -> Option<AppRecord> {
         parse_desktop_entry(contents, Path::new("/tmp/example.desktop"))
+    }
+
+    fn temporary_directory(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system time should be after Unix epoch")
+            .as_nanos();
+        let path =
+            env::temp_dir().join(format!("rat-search-{name}-{}-{unique}", std::process::id()));
+
+        fs::create_dir_all(&path).expect("temporary directory should be created");
+
+        path
+    }
+
+    fn write_file(path: &Path, contents: &str) {
+        fs::create_dir_all(path.parent().expect("test path should have a parent"))
+            .expect("test parent directory should be created");
+        fs::write(path, contents).expect("test file should be written");
     }
 
     #[test]
@@ -220,6 +249,44 @@ mod tests {
         assert_eq!(record.categories, ["Utility", "Development"]);
         assert_eq!(record.keywords, ["Search", "Launch"]);
         assert!(record.terminal);
+    }
+
+    #[test]
+    fn scan_application_directory_resolves_icon_values_after_parsing() {
+        let root = temporary_directory("app-scan-icons");
+        let app_directory = root.join("applications");
+        let icon_root = root.join("icons");
+        let icon_path = icon_root.join("hicolor/48x48/apps/example-app.png");
+        let desktop_file = app_directory.join("example.desktop");
+        write_file(&icon_path, "icon");
+        write_file(
+            &desktop_file,
+            r#"
+            [Desktop Entry]
+            Type=Application
+            Name=Example App
+            Exec=example
+            Icon=example-app
+            "#,
+        );
+        let icon_resolver = AppIconResolver::from_roots([icon_root]);
+        let mut records_by_id = HashMap::new();
+
+        scan_application_directory(&app_directory, &mut records_by_id, &icon_resolver);
+
+        let record = records_by_id
+            .get("example.desktop")
+            .expect("app should be discovered");
+        assert_eq!(record.icon.as_deref(), Some(icon_path.to_str().unwrap()));
+        assert_eq!(
+            parse_desktop_file(&desktop_file)
+                .expect("desktop file should parse")
+                .icon
+                .as_deref(),
+            Some("example-app")
+        );
+
+        fs::remove_dir_all(root).expect("temporary directory should be removed");
     }
 
     #[test]

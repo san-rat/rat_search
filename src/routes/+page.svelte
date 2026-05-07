@@ -290,6 +290,8 @@
             <span class="app-icon" aria-hidden="true">
               {#if imageSrc}
                 <img src={imageSrc} alt="" />
+              {:else if result.icon === "app"}
+                <span class="generic-app-icon"></span>
               {:else}
                 <span>{iconFallback(result.title)}</span>
               {/if}
@@ -531,6 +533,30 @@
     height: 24px;
     display: block;
     object-fit: contain;
+  }
+
+  .generic-app-icon {
+    position: relative;
+    width: 18px;
+    height: 18px;
+    display: block;
+    color: currentColor;
+  }
+
+  .generic-app-icon::before {
+    content: "";
+    position: absolute;
+    top: 1px;
+    left: 1px;
+    width: 7px;
+    height: 7px;
+    border-radius: 2px;
+    background: currentColor;
+    box-shadow:
+      9px 0 0 currentColor,
+      0 9px 0 currentColor,
+      9px 9px 0 currentColor;
+    opacity: 0.78;
   }
 
   .result-copy {

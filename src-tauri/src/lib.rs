@@ -7,6 +7,7 @@ use std::{
 use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Size, WebviewWindow};
 
 mod app_discovery;
+mod app_icons;
 mod app_launch;
 mod app_search;
 mod file_actions;
