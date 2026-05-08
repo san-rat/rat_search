@@ -1,6 +1,6 @@
 # Local Run, Packaging, and Autostart
 
-This guide covers the v0.2 local run, Linux packaging path, and startup
+This guide covers the v0.3 local run, Linux packaging path, and startup
 preparation for Rat Search.
 
 ## Local Development
@@ -18,7 +18,8 @@ Expected behavior:
 - `Alt+Space` toggles the launcher on X11.
 - On Wayland, global shortcut registration is skipped; bind your desktop
   shortcut to `rat-search toggle`.
-- Search results use in-memory app and file/folder catalogs scanned at startup.
+- Search results use in-memory app and file/folder catalogs scanned at startup,
+  plus lightweight search history state loaded from app data.
 
 If the Tauri CLI cannot find `cargo`, make sure Cargo's bin directory is on
 `PATH`:
@@ -45,7 +46,7 @@ Linux build artifacts are written under:
 src-tauri/target/release/bundle/
 ```
 
-Version 0.2 builds Debian and RPM packages by default:
+Version 0.3 builds Debian and RPM packages by default:
 
 ```text
 src-tauri/target/release/bundle/deb/
@@ -59,7 +60,7 @@ ready for the hotkey.
 ## Autostart Preparation
 
 Autostart is useful for Rat Search because the app should already be warm when
-the user presses the launcher hotkey. Version 0.2 prepares for that workflow but
+the user presses the launcher hotkey. Version 0.3 prepares for that workflow but
 does not enable it automatically.
 
 Startup is not auto-enabled in this step because there is no settings screen or
@@ -83,10 +84,10 @@ remain resident with the window hidden after startup.
 Autostart means Rat Search uses some RAM while idle. CPU use should be near zero
 after initial startup work finishes.
 
-The main startup costs in v0.2 are scanning installed `.desktop` application
-entries and indexing conservative user folders once. Search uses those in-memory
-catalogs, so typing should stay responsive and should not trigger repeated
-filesystem scans.
+The main startup costs in v0.3 are scanning installed `.desktop` application
+entries, indexing conservative user folders once, and loading lightweight search
+history from app data. Search uses those in-memory catalogs, so typing should
+stay responsive and should not trigger repeated filesystem scans.
 
-The v0.2 acceptance target is that Rat Search remains comfortable on an Ubuntu
+The v0.3 acceptance target is that Rat Search remains comfortable on an Ubuntu
 machine with 8GB RAM.
