@@ -3,9 +3,24 @@
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
 
-  type SearchSource = "applications" | "files" | "folders";
-  type SearchAction = "launch_app" | "open_path" | "reveal_path" | "copy_path";
-  type PathAction = Exclude<SearchAction, "launch_app">;
+  type SearchSource =
+    | "applications"
+    | "files"
+    | "folders"
+    | "calculator"
+    | "web"
+    | "settings"
+    | "history";
+  type SearchAction =
+    | "launch_app"
+    | "open_path"
+    | "reveal_path"
+    | "copy_path"
+    | "copy_text"
+    | "open_url"
+    | "open_setting"
+    | "reuse_query";
+  type PathAction = "open_path" | "reveal_path" | "copy_path";
   type ShortcutAction = Extract<SearchAction, "reveal_path" | "copy_path">;
 
   type ApplicationMetadata = {
@@ -24,7 +39,42 @@
     kind: "folder";
   };
 
-  type SearchMetadata = ApplicationMetadata | FileMetadata | FolderMetadata;
+  type CalculatorMetadata = {
+    kind: "calculator";
+    expression: string;
+    result: string;
+    copy_text: string;
+  };
+
+  type WebMetadata = {
+    kind: "web";
+    shortcut: string;
+    query: string;
+    url: string;
+  };
+
+  type SettingMetadata = {
+    kind: "setting";
+    setting_id: string;
+    panel: string;
+    command: string;
+  };
+
+  type HistoryMetadata = {
+    kind: "history";
+    query: string;
+    last_used_ms: number;
+    use_count: number;
+  };
+
+  type SearchMetadata =
+    | ApplicationMetadata
+    | FileMetadata
+    | FolderMetadata
+    | CalculatorMetadata
+    | WebMetadata
+    | SettingMetadata
+    | HistoryMetadata;
 
   type SearchResult = {
     id: string;
@@ -260,6 +310,14 @@
         return "File";
       case "folders":
         return "Folder";
+      case "calculator":
+        return "Calc";
+      case "web":
+        return "Web";
+      case "settings":
+        return "Set";
+      case "history":
+        return "Hist";
     }
   }
 
@@ -337,7 +395,7 @@
   }
 
   function isPathAction(action: SearchAction): action is PathAction {
-    return action !== "launch_app";
+    return action === "open_path" || action === "reveal_path" || action === "copy_path";
   }
 
   function selectedResultCanRunShortcut(action: ShortcutAction) {
