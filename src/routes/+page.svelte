@@ -330,24 +330,59 @@
   }
 
   function displaySubtitle(result: SearchResult) {
-    if (result.source === "applications") {
-      return result.subtitle ?? "";
+    switch (result.source) {
+      case "applications":
+        return result.subtitle ?? "";
+      case "folders":
+        return joinSubtitleParts([result.subtitle, "Folder"]);
+      case "files": {
+        const metadata = result.metadata?.kind === "file" ? result.metadata : null;
+        return joinSubtitleParts([
+          result.subtitle,
+          extensionLabel(metadata?.extension ?? null),
+          modifiedLabel(metadata?.modified_time_ms ?? null),
+        ]);
+      }
+      case "calculator":
+        return firstSubtitlePart([calculatorMetadata(result)?.expression, result.subtitle]);
+      case "web": {
+        const metadata = webMetadata(result);
+        return firstSubtitlePart([
+          metadata?.query,
+          result.subtitle,
+          webHostLabel(metadata?.url ?? null),
+        ]);
+      }
+      case "settings":
+        return firstSubtitlePart(["System Settings", result.subtitle]);
+      case "history": {
+        const metadata = historyMetadata(result);
+        return firstSubtitlePart([
+          metadata ? `Search history - used ${metadata.use_count} times` : null,
+          result.subtitle,
+        ]);
+      }
     }
-
-    if (result.source === "folders") {
-      return joinSubtitleParts([result.subtitle, "Folder"]);
-    }
-
-    const metadata = result.metadata?.kind === "file" ? result.metadata : null;
-    return joinSubtitleParts([
-      result.subtitle,
-      extensionLabel(metadata?.extension ?? null),
-      modifiedLabel(metadata?.modified_time_ms ?? null),
-    ]);
   }
 
   function joinSubtitleParts(parts: Array<string | null | undefined>) {
     return parts.map((part) => part?.trim()).filter(Boolean).join(" - ");
+  }
+
+  function firstSubtitlePart(parts: Array<string | null | undefined>) {
+    return parts.map((part) => part?.trim()).find(Boolean) ?? "";
+  }
+
+  function webHostLabel(url: string | null) {
+    if (!url) {
+      return null;
+    }
+
+    try {
+      return new URL(url).host;
+    } catch {
+      return null;
+    }
   }
 
   function extensionLabel(extension: string | null) {
