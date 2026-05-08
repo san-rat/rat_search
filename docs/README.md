@@ -9,6 +9,8 @@ docs to read first.
 - [Version 0.3 Overview](version_0_3.md): features, behavior, architecture, and
   verification notes for calculator, web shortcut, settings, and history
   search.
+- [Version 0.3 Testing Guide](version_0_3_testing.md): automated and manual
+  checks for local v0.3 verification.
 - [Local Run, Packaging, and Autostart](local_run_packaging_autostart.md): how to
   run the app locally, package it, and prepare startup behavior.
 

@@ -169,6 +169,9 @@ Final hands-on desktop verification remains the release gate for launcher
 visibility, hotkeys, clipboard behavior, browser/settings opening, history
 reuse, long text truncation, and Wayland/X11 behavior.
 
+For a local verification checklist, see the
+[Version 0.3 Testing Guide](version_0_3_testing.md).
+
 ## Not Included In Version 0.3
 
 - Full document content indexing.
