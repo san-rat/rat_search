@@ -6,6 +6,10 @@ use crate::{
 };
 
 const WEB_SHORTCUT_SCORE: i32 = 700;
+const GOOGLE_SHORTCUT: &str = "google";
+const GOOGLE_LABEL: &str = "Google";
+const GOOGLE_SEARCH_URL_PREFIX: &str = "https://www.google.com/search?q=";
+const QUESTION_WORDS: &[&str] = &["what", "how", "is", "will", "should", "do"];
 
 pub(crate) fn search_web_shortcuts(query: &str, limit: usize) -> Vec<SearchResult> {
     let limit = settings::normalize_result_limit(limit);
@@ -14,19 +18,16 @@ pub(crate) fn search_web_shortcuts(query: &str, limit: usize) -> Vec<SearchResul
         return Vec::new();
     }
 
-    let Some((shortcut, search_query)) = parse_shortcut_query(query) else {
-        return Vec::new();
-    };
-    let Some(web_shortcut) = shortcut_for(shortcut) else {
+    let Some(search_query) = question_search_query(query) else {
         return Vec::new();
     };
 
     let encoded_query = percent_encode(search_query);
-    let url = web_shortcut.url_for(&encoded_query);
+    let url = google_url_for(&encoded_query);
 
     vec![SearchResult {
-        id: format!("web:{shortcut}:{encoded_query}"),
-        title: format!("Search {}", web_shortcut.label),
+        id: format!("web:{GOOGLE_SHORTCUT}:{encoded_query}"),
+        title: format!("Search {GOOGLE_LABEL}"),
         subtitle: Some(search_query.to_owned()),
         icon: Some("web".to_owned()),
         source: SearchSource::Web,
@@ -34,7 +35,7 @@ pub(crate) fn search_web_shortcuts(query: &str, limit: usize) -> Vec<SearchResul
         path: None,
         score: WEB_SHORTCUT_SCORE,
         metadata: Some(SearchMetadata::Web {
-            shortcut: shortcut.to_owned(),
+            shortcut: GOOGLE_SHORTCUT.to_owned(),
             query: search_query.to_owned(),
             url,
         }),
@@ -46,34 +47,32 @@ pub(crate) fn is_allowed_url(url: &str) -> bool {
         return false;
     }
 
-    supported_url_prefixes().iter().any(|prefix| {
-        let Some(encoded_query) = url.strip_prefix(prefix) else {
-            return false;
-        };
+    let Some(encoded_query) = url.strip_prefix(GOOGLE_SEARCH_URL_PREFIX) else {
+        return false;
+    };
 
-        !encoded_query.is_empty() && is_valid_generated_query(encoded_query)
-    })
+    !encoded_query.is_empty() && is_valid_generated_query(encoded_query)
 }
 
-fn parse_shortcut_query(query: &str) -> Option<(&str, &str)> {
+fn question_search_query(query: &str) -> Option<&str> {
     let query = query.trim();
-    let separator_index = query.find(char::is_whitespace)?;
-    let shortcut = &query[..separator_index];
-    let search_query = query[separator_index..].trim();
 
-    (!search_query.is_empty()).then_some((shortcut, search_query))
+    if query.is_empty() {
+        return None;
+    }
+
+    (query.ends_with('?') || contains_question_word(query)).then_some(query)
 }
 
-fn shortcut_for(shortcut: &str) -> Option<WebShortcut> {
-    match shortcut {
-        "?" => Some(WebShortcut::new("Google", WebUrlTemplate::Google)),
-        "g" => Some(WebShortcut::new("Google", WebUrlTemplate::Google)),
-        "w" => Some(WebShortcut::new("Wikipedia", WebUrlTemplate::Wikipedia)),
-        "yt" => Some(WebShortcut::new("YouTube", WebUrlTemplate::YouTube)),
-        "gh" => Some(WebShortcut::new("GitHub", WebUrlTemplate::GitHub)),
-        "maps" => Some(WebShortcut::new("Google Maps", WebUrlTemplate::Maps)),
-        _ => None,
-    }
+fn contains_question_word(query: &str) -> bool {
+    query
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .any(|word| {
+            QUESTION_WORDS
+                .iter()
+                .any(|question_word| word.eq_ignore_ascii_case(question_word))
+        })
 }
 
 fn percent_encode(value: &str) -> String {
@@ -92,14 +91,8 @@ fn percent_encode(value: &str) -> String {
     encoded
 }
 
-fn supported_url_prefixes() -> [&'static str; 5] {
-    [
-        WebUrlTemplate::Google.url_prefix(),
-        WebUrlTemplate::Wikipedia.url_prefix(),
-        WebUrlTemplate::YouTube.url_prefix(),
-        WebUrlTemplate::GitHub.url_prefix(),
-        WebUrlTemplate::Maps.url_prefix(),
-    ]
+fn google_url_for(encoded_query: &str) -> String {
+    format!("{GOOGLE_SEARCH_URL_PREFIX}{encoded_query}")
 }
 
 fn is_valid_generated_query(value: &str) -> bool {
@@ -128,43 +121,6 @@ fn is_upper_hex_digit(byte: u8) -> bool {
     byte.is_ascii_digit() || matches!(byte, b'A'..=b'F')
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct WebShortcut {
-    label: &'static str,
-    template: WebUrlTemplate,
-}
-
-impl WebShortcut {
-    fn new(label: &'static str, template: WebUrlTemplate) -> Self {
-        Self { label, template }
-    }
-
-    fn url_for(&self, encoded_query: &str) -> String {
-        format!("{}{encoded_query}", self.template.url_prefix())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WebUrlTemplate {
-    Google,
-    Wikipedia,
-    YouTube,
-    GitHub,
-    Maps,
-}
-
-impl WebUrlTemplate {
-    fn url_prefix(&self) -> &'static str {
-        match self {
-            WebUrlTemplate::Google => "https://www.google.com/search?q=",
-            WebUrlTemplate::Wikipedia => "https://en.wikipedia.org/wiki/Special:Search?search=",
-            WebUrlTemplate::YouTube => "https://www.youtube.com/results?search_query=",
-            WebUrlTemplate::GitHub => "https://github.com/search?q=",
-            WebUrlTemplate::Maps => "https://www.google.com/maps/search/",
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -183,26 +139,24 @@ mod tests {
     }
 
     #[test]
-    fn supported_prefixes_return_expected_https_urls() {
+    fn question_queries_return_expected_google_urls() {
         let cases = [
             (
-                "? rust tauri",
-                "https://www.google.com/search?q=rust%20tauri",
+                "what is rust",
+                "https://www.google.com/search?q=what%20is%20rust",
             ),
             (
-                "g rust tauri",
-                "https://www.google.com/search?q=rust%20tauri",
+                "How does Tauri work",
+                "https://www.google.com/search?q=How%20does%20Tauri%20work",
             ),
             (
-                "w rust language",
-                "https://en.wikipedia.org/wiki/Special:Search?search=rust%20language",
+                "rust tauri?",
+                "https://www.google.com/search?q=rust%20tauri%3F",
             ),
             (
-                "yt lofi beats",
-                "https://www.youtube.com/results?search_query=lofi%20beats",
+                "the question is simple",
+                "https://www.google.com/search?q=the%20question%20is%20simple",
             ),
-            ("gh tauri apps", "https://github.com/search?q=tauri%20apps"),
-            ("maps colombo", "https://www.google.com/maps/search/colombo"),
         ];
 
         for (query, expected_url) in cases {
@@ -214,36 +168,32 @@ mod tests {
     }
 
     #[test]
-    fn question_mark_and_g_prefixes_both_search_google() {
-        assert_eq!(
-            metadata_url(&web_result("? rust").expect("web result")),
-            "https://www.google.com/search?q=rust"
-        );
-        assert_eq!(
-            metadata_url(&web_result("g rust").expect("web result")),
-            "https://www.google.com/search?q=rust"
-        );
+    fn configured_question_words_match_case_insensitively() {
+        for query in [
+            "WHAT is rust",
+            "how does this work",
+            "is this open",
+            "will it launch",
+            "should I test this",
+            "do files open",
+        ] {
+            assert!(web_result(query).is_some(), "{query} should match");
+        }
     }
 
     #[test]
     fn percent_encoding_handles_spaces_symbols_and_non_ascii() {
-        let result = web_result("g café & rust").expect("web result");
+        let result = web_result("what is café & rust?").expect("web result");
 
         assert_eq!(
             metadata_url(&result),
-            "https://www.google.com/search?q=caf%C3%A9%20%26%20rust"
+            "https://www.google.com/search?q=what%20is%20caf%C3%A9%20%26%20rust%3F"
         );
     }
 
     #[test]
     fn generated_web_urls_are_allowed() {
-        for query in [
-            "? rust tauri",
-            "w rust language",
-            "yt lofi beats",
-            "gh tauri apps",
-            "maps café & rust",
-        ] {
+        for query in ["what is rust", "How does Tauri work", "maps café & rust?"] {
             let result = web_result(query).expect("web result");
 
             assert!(
@@ -261,32 +211,50 @@ mod tests {
             "https://www.google.com/search?q=",
             "https://www.google.com/search?q=rust&source=rat",
             "https://www.google.com/search?q=rust tauri",
+            "https://www.google.com/search?q=rust%",
+            "https://www.google.com/search?q=rust%2",
+            "https://www.google.com/search?q=rust%XZ",
+            "https://www.google.com/search?q=rust%2ftauri",
+            "https://en.wikipedia.org/wiki/Special:Search?search=rust",
+            "https://www.youtube.com/results?search_query=lofi",
+            "https://www.google.com/maps/search/colombo",
             "https://github.com/search?q=rust%2ftauri",
-            "https://github.com/search?q=rust%",
-            "https://github.com/search?q=rust%2",
-            "https://github.com/search?q=rust%XZ",
         ] {
             assert!(!is_allowed_url(url), "{url} should be rejected");
         }
     }
 
     #[test]
-    fn unsupported_prefixes_return_no_result() {
-        for query in ["x rust", "google rust", "github rust", "m rust"] {
+    fn old_web_prefixes_return_no_result() {
+        for query in [
+            "g rust",
+            "? rust",
+            "w rust",
+            "yt lofi",
+            "gh tauri",
+            "maps colombo",
+        ] {
             assert!(web_result(query).is_none(), "{query} should be rejected");
         }
     }
 
     #[test]
-    fn prefixes_without_query_return_no_result() {
-        for query in ["?", "g", "w ", "yt    ", "gh", "maps"] {
+    fn empty_or_non_question_queries_return_no_result() {
+        for query in ["", "   ", "firefox", "report pdf", "rust", "maps"] {
             assert!(web_result(query).is_none(), "{query} should be rejected");
         }
     }
 
     #[test]
-    fn ordinary_queries_do_not_produce_web_results() {
-        for query in ["firefox", "report pdf", "rust", "maps"] {
+    fn question_words_require_word_boundaries() {
+        for query in [
+            "history notes",
+            "this report",
+            "doing tasks",
+            "show files",
+            "whatnot",
+            "island maps",
+        ] {
             assert!(web_result(query).is_none(), "{query} should not match");
         }
     }
@@ -294,7 +262,7 @@ mod tests {
     #[test]
     fn zero_limit_uses_default_limit() {
         assert_eq!(
-            search_web_shortcuts("g rust", 0)
+            search_web_shortcuts("what is rust", 0)
                 .first()
                 .expect("web result")
                 .title,
@@ -304,14 +272,14 @@ mod tests {
 
     #[test]
     fn result_uses_expected_frontend_shape() {
-        let result = web_result(" maps colombo fort ").expect("web result");
+        let result = web_result(" what is colombo fort? ").expect("web result");
 
         assert_eq!(
             serde_json::to_value(result).expect("result should serialize"),
             json!({
-                "id": "web:maps:colombo%20fort",
-                "title": "Search Google Maps",
-                "subtitle": "colombo fort",
+                "id": "web:google:what%20is%20colombo%20fort%3F",
+                "title": "Search Google",
+                "subtitle": "what is colombo fort?",
                 "icon": "web",
                 "source": "web",
                 "action": "open_url",
@@ -319,9 +287,9 @@ mod tests {
                 "score": 700,
                 "metadata": {
                     "kind": "web",
-                    "shortcut": "maps",
-                    "query": "colombo fort",
-                    "url": "https://www.google.com/maps/search/colombo%20fort"
+                    "shortcut": "google",
+                    "query": "what is colombo fort?",
+                    "url": "https://www.google.com/search?q=what%20is%20colombo%20fort%3F"
                 }
             })
         );

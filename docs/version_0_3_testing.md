@@ -110,18 +110,17 @@ Expected startup behavior:
 - Search `2^8`; confirm result `256`.
 - Search invalid syntax such as `2+*`; confirm no calculator result appears.
 
-### Web Shortcuts
+### Google Question Search
 
 These checks open browser tabs or windows.
 
-- Search `g rust tauri`; press `Enter`; confirm Google opens.
-- Search `? rust tauri`; press `Enter`; confirm Google opens.
-- Search `w rust language`; press `Enter`; confirm Wikipedia opens.
-- Search `yt lofi`; press `Enter`; confirm YouTube opens.
-- Search `gh tauri`; press `Enter`; confirm GitHub search opens.
-- Search `maps colombo`; press `Enter`; confirm Google Maps opens.
-- Search ordinary non-prefixed app/file terms and confirm web results do not
-  appear unexpectedly.
+- Search `what is rust`; press `Enter`; confirm Google opens.
+- Search `How does Tauri work`; press `Enter`; confirm Google opens.
+- Search `rust tauri?`; press `Enter`; confirm Google opens.
+- Search `g rust`, `yt lofi`, `gh tauri`, `maps colombo`, and `w rust`;
+  confirm these old fixed prefixes no longer produce web results by themselves.
+- Search `history notes`, `doing tasks`, and ordinary app/file terms; confirm
+  web results do not appear unexpectedly.
 
 ### GNOME Settings
 
@@ -142,7 +141,7 @@ These checks open GNOME Settings panels.
 History tests write normalized query text to the app data history file.
 
 - Run a successful non-history action such as launching an app, opening a web
-  shortcut, copying a calculator result, or opening a settings panel.
+  question search, copying a calculator result, or opening a settings panel.
 - Search part of that same query later and confirm a `Hist` result can appear
   below stronger live results.
 - Press `Enter` on a history result and confirm the old query is restored in the
@@ -154,7 +153,7 @@ History tests write normalized query text to the app data history file.
 
 When a check fails, record:
 
-- The exact query or shortcut used.
+- The exact query used.
 - The selected result source label.
 - The expected behavior and actual behavior.
 - Whether the session is X11 or Wayland:

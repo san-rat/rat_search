@@ -5,7 +5,7 @@ and Svelte.
 
 Rat Search starts as a resident desktop utility and opens a compact launcher on
 demand. Version 0.3 searches installed applications, files, folders, local
-calculator expressions, explicit web shortcuts, GNOME Settings panels, and
+calculator expressions, Google question searches, GNOME Settings panels, and
 recent search history.
 
 ## Features
@@ -14,8 +14,8 @@ recent search history.
 - Search files and folders by name from `Desktop`, `Documents`, `Downloads`,
   and `Pictures`.
 - Evaluate local arithmetic expressions and copy calculator results.
-- Open explicit web shortcut searches for Google, Wikipedia, YouTube, GitHub,
-  and Google Maps.
+- Open Google searches for question-style queries, including sentences ending
+  in `?` or containing whole words such as `what`, `how`, or `should`.
 - Find whitelisted GNOME Settings panels such as Wi-Fi, Bluetooth, Displays,
   Keyboard, and Sound.
 - Reuse recent successful search queries from local history.

@@ -925,13 +925,13 @@ mod tests {
 
     #[test]
     fn mixed_search_keeps_exact_app_above_web_and_history_results() {
-        let app_catalog = catalog(vec![app("g-rust.desktop", "g rust")]);
-        let history = history(&[("g rust", 1_700, 10)]);
+        let app_catalog = catalog(vec![app("what-is-rust.desktop", "what is rust")]);
+        let history = history(&[("what is rust", 1_700, 10)]);
 
-        let results = search_all(&app_catalog, None, Some(&history), "g rust", 8);
+        let results = search_all(&app_catalog, None, Some(&history), "what is rust", 8);
 
         assert_eq!(results[0].source, SearchSource::Applications);
-        assert_eq!(results[0].title, "g rust");
+        assert_eq!(results[0].title, "what is rust");
         assert!(results
             .iter()
             .any(|result| result.source == SearchSource::Web));
@@ -951,10 +951,10 @@ mod tests {
     }
 
     #[test]
-    fn mixed_search_includes_explicit_web_shortcuts() {
+    fn mixed_search_includes_google_question_search() {
         let app_catalog = AppCatalog::default();
 
-        let results = search_all(&app_catalog, None, None, "g rust tauri", 8);
+        let results = search_all(&app_catalog, None, None, "what is rust tauri", 8);
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].source, SearchSource::Web);

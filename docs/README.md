@@ -7,8 +7,8 @@ docs to read first.
 ## Current Version
 
 - [Version 0.3 Overview](version_0_3.md): features, behavior, architecture, and
-  verification notes for calculator, web shortcut, settings, and history
-  search.
+  verification notes for calculator, Google question search, settings, and
+  history search.
 - [Version 0.3 Testing Guide](version_0_3_testing.md): automated and manual
   checks for local v0.3 verification.
 - [Local Run, Packaging, and Autostart](local_run_packaging_autostart.md): how to
@@ -23,7 +23,7 @@ docs to read first.
 
 - Rat Search is a resident Tauri desktop utility for Ubuntu Linux.
 - The launcher searches applications, files, folders, calculator expressions,
-  explicit web shortcuts, GNOME Settings panels, and recent query history.
+  Google question searches, GNOME Settings panels, and recent query history.
 - File indexing is conservative by default: `Desktop`, `Documents`, `Downloads`,
   and `Pictures`.
 - Search uses in-memory catalogs and lightweight history state so typing does

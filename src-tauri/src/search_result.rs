@@ -223,16 +223,16 @@ mod tests {
     fn web_metadata_serializes_to_frontend_shape() {
         assert_eq!(
             serde_json::to_value(SearchMetadata::Web {
-                shortcut: "g".to_owned(),
-                query: "rust tauri".to_owned(),
-                url: "https://www.google.com/search?q=rust%20tauri".to_owned(),
+                shortcut: "google".to_owned(),
+                query: "what is rust".to_owned(),
+                url: "https://www.google.com/search?q=what%20is%20rust".to_owned(),
             })
             .expect("web metadata should serialize"),
             json!({
                 "kind": "web",
-                "shortcut": "g",
-                "query": "rust tauri",
-                "url": "https://www.google.com/search?q=rust%20tauri"
+                "shortcut": "google",
+                "query": "what is rust",
+                "url": "https://www.google.com/search?q=what%20is%20rust"
             })
         );
     }
