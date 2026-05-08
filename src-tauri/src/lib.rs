@@ -1,4 +1,5 @@
 use std::{
+    path::{Path, PathBuf},
     sync::{Arc, RwLock},
     thread,
     time::Duration,
@@ -25,15 +26,18 @@ use app_discovery::AppCatalog;
 use app_launch::LaunchResult;
 use file_actions::ValidatedPath;
 use file_index::FileIndex;
+use search_history::SearchHistory;
 use search_result::{SearchResult, SearchSource};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
 
 type FileIndexState = Arc<RwLock<FileIndex>>;
+type SearchHistoryState = Arc<RwLock<SearchHistory>>;
 
 const LAUNCHER_WINDOW_LABEL: &str = "main";
 const LAUNCHER_SHOWN_EVENT: &str = "launcher:shown";
 const TOGGLE_ARG: &str = "toggle";
+const SEARCH_HISTORY_FILE_NAME: &str = "search-history.json";
 const DELAYED_CENTER_MS: u64 = 80;
 const LAUNCHER_VERTICAL_PERCENT: u32 = 25;
 const LAUNCHER_SEARCH_ROW_CENTER_OFFSET: i32 = 42;
@@ -284,6 +288,56 @@ fn path_for_opener(path: &std::path::Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+fn history_file_path_from_data_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(SEARCH_HISTORY_FILE_NAME)
+}
+
+fn search_history_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|data_dir| history_file_path_from_data_dir(&data_dir))
+        .map_err(|error| error.to_string())
+}
+
+fn fallback_search_history_path() -> PathBuf {
+    std::env::temp_dir()
+        .join("rat-search")
+        .join(SEARCH_HISTORY_FILE_NAME)
+}
+
+fn load_search_history_state(app: &tauri::AppHandle) -> SearchHistoryState {
+    let history_path = search_history_path(app).unwrap_or_else(|error| {
+        eprintln!("failed to resolve search history path: {error}");
+        fallback_search_history_path()
+    });
+    let history = SearchHistory::load(history_path);
+    let entry_count = history.entries().len();
+
+    dev_log(format!("loaded {entry_count} search history entries"));
+
+    Arc::new(RwLock::new(history))
+}
+
+#[allow(dead_code)]
+fn record_search_history_in_state(
+    state: &SearchHistoryState,
+    query: &str,
+    now_ms: u64,
+) -> Result<(), String> {
+    if search_history::normalize_query(query).is_empty() {
+        return Ok(());
+    }
+
+    let mut history = state
+        .write()
+        .map_err(|_| "Search history unavailable".to_owned())?;
+
+    history.record_query_at(query, now_ms);
+    history
+        .save()
+        .map_err(|_| "Could not save search history".to_owned())
+}
+
 #[tauri::command]
 fn open_path(
     app: tauri::AppHandle,
@@ -504,6 +558,9 @@ pub fn run() {
             dev_log(format!("discovered {} applications", app_catalog.len()));
             app.manage(app_catalog);
 
+            let search_history = load_search_history_state(app.handle());
+            app.manage(search_history);
+
             let file_index = Arc::new(RwLock::new(FileIndex::new()));
             app.manage(file_index.clone());
             start_file_index_scan(file_index);
@@ -527,11 +584,16 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use crate::{
         app_discovery::{AppCatalog, AppRecord},
         file_index::{FileIndex, FileRecord},
+        search_history::SearchHistory,
         search_result::SearchSource,
     };
 
@@ -566,6 +628,80 @@ mod tests {
 
     fn index(records: Vec<FileRecord>) -> FileIndex {
         FileIndex::from_records(records)
+    }
+
+    fn temporary_directory(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after Unix epoch")
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("rat-search-{name}-{}-{unique}", std::process::id()));
+
+        fs::create_dir_all(&path).expect("temporary directory should be created");
+
+        path
+    }
+
+    fn history_state(path: PathBuf) -> SearchHistoryState {
+        Arc::new(RwLock::new(SearchHistory::load(path)))
+    }
+
+    #[test]
+    fn history_file_path_from_data_dir_appends_history_file_name() {
+        assert_eq!(
+            history_file_path_from_data_dir(Path::new("/tmp/rat-search-data")),
+            PathBuf::from("/tmp/rat-search-data").join(SEARCH_HISTORY_FILE_NAME)
+        );
+    }
+
+    #[test]
+    fn record_search_history_in_state_ignores_empty_queries() {
+        let root = temporary_directory("empty-history-record");
+        let path = root.join("history.json");
+        let state = history_state(path.clone());
+
+        record_search_history_in_state(&state, "   ", 1_700)
+            .expect("empty query should be ignored");
+
+        assert!(
+            !path.exists(),
+            "empty history query should not create a history file"
+        );
+        assert!(state.read().expect("history lock").entries().is_empty());
+
+        fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn record_search_history_in_state_records_and_persists_query() {
+        let root = temporary_directory("persist-history-record");
+        let path = root.join("history.json");
+        let state = history_state(path.clone());
+
+        record_search_history_in_state(&state, " wifi ", 1_700).expect("history should record");
+        let loaded = SearchHistory::load(path);
+
+        assert_eq!(loaded.entries()[0].query, "wifi");
+        assert_eq!(loaded.entries()[0].last_used_ms, 1_700);
+        assert_eq!(loaded.entries()[0].use_count, 1);
+
+        fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn record_search_history_in_state_reports_save_failures() {
+        let root = temporary_directory("history-save-failure");
+        let path = root.join("history.json");
+        fs::create_dir(&path).expect("directory should block file save");
+        let state = history_state(path);
+
+        let error = record_search_history_in_state(&state, "wifi", 1_700)
+            .expect_err("history save should fail");
+
+        assert_eq!(error, "Could not save search history");
+
+        fs::remove_dir_all(root).expect("temporary directory should be removed");
     }
 
     #[test]
