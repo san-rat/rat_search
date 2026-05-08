@@ -3,9 +3,24 @@
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
 
-  type SearchSource = "applications" | "files" | "folders";
-  type SearchAction = "launch_app" | "open_path" | "reveal_path" | "copy_path";
-  type PathAction = Exclude<SearchAction, "launch_app">;
+  type SearchSource =
+    | "applications"
+    | "files"
+    | "folders"
+    | "calculator"
+    | "web"
+    | "settings"
+    | "history";
+  type SearchAction =
+    | "launch_app"
+    | "open_path"
+    | "reveal_path"
+    | "copy_path"
+    | "copy_text"
+    | "open_url"
+    | "open_setting"
+    | "reuse_query";
+  type PathAction = "open_path" | "reveal_path" | "copy_path";
   type ShortcutAction = Extract<SearchAction, "reveal_path" | "copy_path">;
 
   type ApplicationMetadata = {
@@ -24,7 +39,42 @@
     kind: "folder";
   };
 
-  type SearchMetadata = ApplicationMetadata | FileMetadata | FolderMetadata;
+  type CalculatorMetadata = {
+    kind: "calculator";
+    expression: string;
+    result: string;
+    copy_text: string;
+  };
+
+  type WebMetadata = {
+    kind: "web";
+    shortcut: string;
+    query: string;
+    url: string;
+  };
+
+  type SettingMetadata = {
+    kind: "setting";
+    setting_id: string;
+    panel: string;
+    command: string;
+  };
+
+  type HistoryMetadata = {
+    kind: "history";
+    query: string;
+    last_used_ms: number;
+    use_count: number;
+  };
+
+  type SearchMetadata =
+    | ApplicationMetadata
+    | FileMetadata
+    | FolderMetadata
+    | CalculatorMetadata
+    | WebMetadata
+    | SettingMetadata
+    | HistoryMetadata;
 
   type SearchResult = {
     id: string;
@@ -247,6 +297,14 @@
         return "symbolic-icon symbolic-file symbolic-file-archive";
       case "file-document":
         return "symbolic-icon symbolic-file symbolic-file-document";
+      case "calculator":
+        return "symbolic-icon symbolic-calculator";
+      case "web":
+        return "symbolic-icon symbolic-web";
+      case "settings":
+        return "symbolic-icon symbolic-settings";
+      case "history":
+        return "symbolic-icon symbolic-history";
       default:
         return null;
     }
@@ -260,28 +318,71 @@
         return "File";
       case "folders":
         return "Folder";
+      case "calculator":
+        return "Calc";
+      case "web":
+        return "Web";
+      case "settings":
+        return "Set";
+      case "history":
+        return "Hist";
     }
   }
 
   function displaySubtitle(result: SearchResult) {
-    if (result.source === "applications") {
-      return result.subtitle ?? "";
+    switch (result.source) {
+      case "applications":
+        return result.subtitle ?? "";
+      case "folders":
+        return joinSubtitleParts([result.subtitle, "Folder"]);
+      case "files": {
+        const metadata = result.metadata?.kind === "file" ? result.metadata : null;
+        return joinSubtitleParts([
+          result.subtitle,
+          extensionLabel(metadata?.extension ?? null),
+          modifiedLabel(metadata?.modified_time_ms ?? null),
+        ]);
+      }
+      case "calculator":
+        return firstSubtitlePart([calculatorMetadata(result)?.expression, result.subtitle]);
+      case "web": {
+        const metadata = webMetadata(result);
+        return firstSubtitlePart([
+          metadata?.query,
+          result.subtitle,
+          webHostLabel(metadata?.url ?? null),
+        ]);
+      }
+      case "settings":
+        return firstSubtitlePart(["System Settings", result.subtitle]);
+      case "history": {
+        const metadata = historyMetadata(result);
+        return firstSubtitlePart([
+          metadata ? `Search history - used ${metadata.use_count} times` : null,
+          result.subtitle,
+        ]);
+      }
     }
-
-    if (result.source === "folders") {
-      return joinSubtitleParts([result.subtitle, "Folder"]);
-    }
-
-    const metadata = result.metadata?.kind === "file" ? result.metadata : null;
-    return joinSubtitleParts([
-      result.subtitle,
-      extensionLabel(metadata?.extension ?? null),
-      modifiedLabel(metadata?.modified_time_ms ?? null),
-    ]);
   }
 
   function joinSubtitleParts(parts: Array<string | null | undefined>) {
     return parts.map((part) => part?.trim()).filter(Boolean).join(" - ");
+  }
+
+  function firstSubtitlePart(parts: Array<string | null | undefined>) {
+    return parts.map((part) => part?.trim()).find(Boolean) ?? "";
+  }
+
+  function webHostLabel(url: string | null) {
+    if (!url) {
+      return null;
+    }
+
+    try {
+      return new URL(url).host;
+    } catch {
+      return null;
+    }
   }
 
   function extensionLabel(extension: string | null) {
@@ -337,7 +438,7 @@
   }
 
   function isPathAction(action: SearchAction): action is PathAction {
-    return action !== "launch_app";
+    return action === "open_path" || action === "reveal_path" || action === "copy_path";
   }
 
   function selectedResultCanRunShortcut(action: ShortcutAction) {
@@ -361,16 +462,43 @@
     );
   }
 
+  function calculatorMetadata(result: SearchResult) {
+    return result.metadata?.kind === "calculator" ? result.metadata : null;
+  }
+
+  function webMetadata(result: SearchResult) {
+    return result.metadata?.kind === "web" ? result.metadata : null;
+  }
+
+  function settingMetadata(result: SearchResult) {
+    return result.metadata?.kind === "setting" ? result.metadata : null;
+  }
+
+  function historyMetadata(result: SearchResult) {
+    return result.metadata?.kind === "history" ? result.metadata : null;
+  }
+
   function actionFailureMessage(action: SearchAction) {
     if (action === "launch_app") {
       return "Could not launch app";
     }
 
-    if (action === "copy_path") {
+    if (action === "copy_path" || action === "copy_text") {
       return "Could not complete action";
     }
 
     return "Could not open item";
+  }
+
+  function failSelectedAction(action: SearchAction) {
+    actionError = actionFailureMessage(action);
+    focusSearchInput();
+  }
+
+  function recordSearchHistory(queryBeforeAction: string) {
+    void invoke("record_search_history", { query: queryBeforeAction }).catch((error) => {
+      console.error("failed to record search history", error);
+    });
   }
 
   async function runSelectedResultAction(actionOverride?: ShortcutAction) {
@@ -385,23 +513,81 @@
     }
 
     const action = actionOverride ?? selected.action;
+    const queryBeforeAction = query.trim();
 
     isRunningAction = true;
     actionError = null;
 
     try {
-      if (action === "launch_app") {
-        await invoke("launch_app", { appId: selected.id });
-      } else if (isPathAction(action)) {
-        if (!selected.path || !isFileSystemResult(selected)) {
-          actionError = actionFailureMessage(action);
+      switch (action) {
+        case "launch_app":
+          await invoke("launch_app", { appId: selected.id });
+          break;
+
+        case "open_path":
+        case "reveal_path":
+        case "copy_path":
+          if (!selected.path || !isFileSystemResult(selected)) {
+            failSelectedAction(action);
+            return;
+          }
+
+          await invoke(action, { path: selected.path });
+          break;
+
+        case "copy_text": {
+          const metadata = calculatorMetadata(selected);
+
+          if (!metadata) {
+            failSelectedAction(action);
+            return;
+          }
+
+          await invoke("copy_text", { text: metadata.copy_text });
+          break;
+        }
+
+        case "open_url": {
+          const metadata = webMetadata(selected);
+
+          if (!metadata) {
+            failSelectedAction(action);
+            return;
+          }
+
+          await invoke("open_url", { url: metadata.url });
+          break;
+        }
+
+        case "open_setting": {
+          const metadata = settingMetadata(selected);
+
+          if (!metadata) {
+            failSelectedAction(action);
+            return;
+          }
+
+          await invoke("open_setting", { settingId: metadata.setting_id });
+          break;
+        }
+
+        case "reuse_query": {
+          const metadata = historyMetadata(selected);
+
+          if (!metadata) {
+            failSelectedAction(action);
+            return;
+          }
+
+          query = metadata.query;
+          searchError = null;
+          actionError = null;
           focusSearchInput();
           return;
         }
-
-        await invoke(action, { path: selected.path });
       }
 
+      recordSearchHistory(queryBeforeAction);
       query = "";
       results = [];
       selectedIndex = -1;
@@ -940,6 +1126,122 @@
 
   .symbolic-file-document::before {
     color: rgba(44, 111, 184, 0.9);
+  }
+
+  .symbolic-calculator {
+    width: 18px;
+    height: 21px;
+  }
+
+  .symbolic-calculator::before {
+    content: "";
+    position: absolute;
+    inset: 1px 2px;
+    border: 1.7px solid currentColor;
+    border-radius: 3px;
+    opacity: 0.82;
+  }
+
+  .symbolic-calculator::after {
+    content: "";
+    position: absolute;
+    top: 5px;
+    left: 6px;
+    width: 6px;
+    height: 2px;
+    border-radius: 1px;
+    background: currentColor;
+    box-shadow:
+      -2px 6px 0 currentColor,
+      4px 6px 0 currentColor,
+      -2px 10px 0 currentColor,
+      4px 10px 0 currentColor;
+    opacity: 0.78;
+  }
+
+  .symbolic-web {
+    width: 21px;
+    height: 21px;
+  }
+
+  .symbolic-web::before {
+    content: "";
+    position: absolute;
+    inset: 2px;
+    border: 1.8px solid currentColor;
+    border-radius: 50%;
+    opacity: 0.78;
+  }
+
+  .symbolic-web::after {
+    content: "";
+    position: absolute;
+    top: 5px;
+    right: 2px;
+    bottom: 5px;
+    left: 2px;
+    border-top: 1.6px solid currentColor;
+    border-bottom: 1.6px solid currentColor;
+    box-shadow:
+      inset 5px 0 0 -3.5px currentColor,
+      inset -5px 0 0 -3.5px currentColor;
+    opacity: 0.72;
+  }
+
+  .symbolic-settings {
+    width: 20px;
+    height: 20px;
+  }
+
+  .symbolic-settings::before {
+    content: "";
+    position: absolute;
+    inset: 4px;
+    border: 2px solid currentColor;
+    border-radius: 50%;
+    box-shadow:
+      0 -6px 0 -2px currentColor,
+      0 6px 0 -2px currentColor,
+      -6px 0 0 -2px currentColor,
+      6px 0 0 -2px currentColor;
+    opacity: 0.78;
+  }
+
+  .symbolic-settings::after {
+    content: "";
+    position: absolute;
+    inset: 8px;
+    border-radius: 50%;
+    background: currentColor;
+    opacity: 0.78;
+  }
+
+  .symbolic-history {
+    width: 21px;
+    height: 21px;
+  }
+
+  .symbolic-history::before {
+    content: "";
+    position: absolute;
+    inset: 2px;
+    border: 1.8px solid currentColor;
+    border-left-color: transparent;
+    border-radius: 50%;
+    opacity: 0.78;
+  }
+
+  .symbolic-history::after {
+    content: "";
+    position: absolute;
+    top: 5px;
+    left: 9px;
+    width: 6px;
+    height: 6px;
+    border-left: 1.8px solid currentColor;
+    border-bottom: 1.8px solid currentColor;
+    border-radius: 0 0 0 2px;
+    opacity: 0.78;
   }
 
   .result-copy {

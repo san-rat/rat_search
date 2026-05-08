@@ -1,0 +1,195 @@
+# Version 0.3 Overview
+
+Version 0.3 expands Rat Search from an app/file/folder launcher into a broader
+local command palette while preserving the v0.2 workflows.
+
+The core workflow is:
+
+```text
+Press hotkey -> search app/file/folder/calculator/web/settings/history -> act
+```
+
+## User-Facing Behavior
+
+- Empty query shows the compact search-only launcher.
+- Typing a query expands the launcher and searches all available sources
+  together.
+- Application results launch with `Enter`.
+- File and folder results open with `Enter`.
+- File and folder results reveal in the file manager with `Ctrl+Enter`.
+- File and folder paths copy with `Ctrl+C` when no search text is selected.
+- Calculator results copy the formatted result with `Enter`.
+- Google question search results open approved HTTPS search URLs with `Enter`.
+- GNOME Settings results open whitelisted settings panels with `Enter`.
+- History results restore the stored query with `Enter` and keep the launcher
+  open.
+- Successful non-history actions are recorded as reusable search history.
+- `Esc` clears the current query or closes the launcher.
+- Long names, subtitles, and source labels truncate inside fixed-height rows.
+
+## Google Question Search
+
+Web results are Google-only and appear when the whole query looks like a
+question. Rat Search creates a Google result when the trimmed query:
+
+- Ends with `?`.
+- Contains any of these case-insensitive whole words: `what`, `how`, `is`,
+  `will`, `should`, or `do`.
+
+Examples:
+
+```text
+what is rust          -> Google
+How does Tauri work   -> Google
+rust tauri?           -> Google
+```
+
+Old fixed prefixes such as `g`, `w`, `yt`, `gh`, `maps`, and `? query` are not
+special shortcuts in v0.3. Rat Search opens only generated
+`https://www.google.com/search?q=...` URLs, and ordinary app/file terms do not
+become web searches.
+
+## Settings Panels
+
+Version 0.3 searches a static GNOME Settings whitelist:
+
+```text
+wifi
+bluetooth
+display
+keyboard
+sound
+privacy
+appearance
+power
+mouse
+network
+printers
+about
+```
+
+Settings actions validate the setting ID against the whitelist before spawning
+`gnome-control-center <panel>`.
+
+## Indexed Folders
+
+Version 0.3 keeps the v0.2 conservative file indexing defaults:
+
+```text
+Desktop
+Documents
+Downloads
+Pictures
+```
+
+Missing folders are skipped quietly. Rat Search does not index the whole home
+directory, hidden folders, system directories, or generated/heavy directories
+such as `node_modules`, `.git`, `target`, `build`, `dist`, `.cache`, `tmp`, and
+`temp`.
+
+The file index is in memory. It is populated once at startup, and search queries
+use the existing index rather than scanning the filesystem per keystroke.
+
+## Search History
+
+Search history stores normalized query text, last-used time, and use count in
+app data. It does not store document contents, file contents, URLs visited
+outside the generated Google question-search action, or arbitrary action
+payloads.
+
+History results rank below stronger live results and use the `History` source.
+Selecting a history result restores the query so the user can search or edit it
+again.
+
+## Architecture
+
+The frontend calls one unified Tauri command:
+
+```text
+search(query, limit) -> Vec<SearchResult>
+```
+
+Each result has a shared shape with an `id`, display text, icon, source, action,
+optional path, score, and source-specific metadata.
+
+Supported result sources:
+
+```text
+applications
+calculator
+settings
+folders
+files
+web
+history
+```
+
+Supported actions:
+
+```text
+launch_app
+open_path
+reveal_path
+copy_path
+copy_text
+open_url
+open_setting
+reuse_query
+```
+
+The backend validates file paths against the managed index, web URLs against the
+generated Google search template, and settings IDs against the static whitelist
+before running external actions.
+
+## Platform Notes
+
+Rat Search targets Ubuntu/Linux first.
+
+On X11, `Alt+Space` toggles the launcher through the app's global shortcut
+registration. On Wayland, global shortcut registration is skipped by design;
+bind your desktop shortcut to:
+
+```bash
+rat-search toggle
+```
+
+This keeps the same launcher workflow while respecting Wayland shortcut
+constraints.
+
+## Verification Status
+
+Version 0.3 implementation has passed the automated gate during development:
+
+```bash
+npm run check
+/home/sanuk/.cargo/bin/cargo check --manifest-path src-tauri/Cargo.toml
+/home/sanuk/.cargo/bin/cargo test --manifest-path src-tauri/Cargo.toml
+git diff --check
+/home/sanuk/.cargo/bin/cargo fmt --manifest-path src-tauri/Cargo.toml --check
+```
+
+The Rust suite covers shared result serialization, calculator parsing, Google
+question-search URL generation and validation, settings search and command
+resolution, history storage/search, unified mixed-source ordering, file actions,
+app launch behavior, app icon resolution, and file indexing.
+
+Final hands-on desktop verification remains the release gate for launcher
+visibility, hotkeys, clipboard behavior, browser/settings opening, history
+reuse, long text truncation, and Wayland/X11 behavior.
+
+For a local verification checklist, see the
+[Version 0.3 Testing Guide](version_0_3_testing.md).
+
+## Not Included In Version 0.3
+
+- Full document content indexing.
+- Preview panels.
+- OCR.
+- Cloud-drive integration.
+- Destructive file actions.
+- File move/delete/rename actions.
+- Settings UI.
+- Plugin marketplace.
+- AI or semantic search.
+- Persistent SQLite indexing.
+- Arbitrary web URL launching.
