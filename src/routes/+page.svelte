@@ -427,16 +427,43 @@
     );
   }
 
+  function calculatorMetadata(result: SearchResult) {
+    return result.metadata?.kind === "calculator" ? result.metadata : null;
+  }
+
+  function webMetadata(result: SearchResult) {
+    return result.metadata?.kind === "web" ? result.metadata : null;
+  }
+
+  function settingMetadata(result: SearchResult) {
+    return result.metadata?.kind === "setting" ? result.metadata : null;
+  }
+
+  function historyMetadata(result: SearchResult) {
+    return result.metadata?.kind === "history" ? result.metadata : null;
+  }
+
   function actionFailureMessage(action: SearchAction) {
     if (action === "launch_app") {
       return "Could not launch app";
     }
 
-    if (action === "copy_path") {
+    if (action === "copy_path" || action === "copy_text") {
       return "Could not complete action";
     }
 
     return "Could not open item";
+  }
+
+  function failSelectedAction(action: SearchAction) {
+    actionError = actionFailureMessage(action);
+    focusSearchInput();
+  }
+
+  function recordSearchHistory(queryBeforeAction: string) {
+    void invoke("record_search_history", { query: queryBeforeAction }).catch((error) => {
+      console.error("failed to record search history", error);
+    });
   }
 
   async function runSelectedResultAction(actionOverride?: ShortcutAction) {
@@ -451,23 +478,81 @@
     }
 
     const action = actionOverride ?? selected.action;
+    const queryBeforeAction = query.trim();
 
     isRunningAction = true;
     actionError = null;
 
     try {
-      if (action === "launch_app") {
-        await invoke("launch_app", { appId: selected.id });
-      } else if (isPathAction(action)) {
-        if (!selected.path || !isFileSystemResult(selected)) {
-          actionError = actionFailureMessage(action);
+      switch (action) {
+        case "launch_app":
+          await invoke("launch_app", { appId: selected.id });
+          break;
+
+        case "open_path":
+        case "reveal_path":
+        case "copy_path":
+          if (!selected.path || !isFileSystemResult(selected)) {
+            failSelectedAction(action);
+            return;
+          }
+
+          await invoke(action, { path: selected.path });
+          break;
+
+        case "copy_text": {
+          const metadata = calculatorMetadata(selected);
+
+          if (!metadata) {
+            failSelectedAction(action);
+            return;
+          }
+
+          await invoke("copy_text", { text: metadata.copy_text });
+          break;
+        }
+
+        case "open_url": {
+          const metadata = webMetadata(selected);
+
+          if (!metadata) {
+            failSelectedAction(action);
+            return;
+          }
+
+          await invoke("open_url", { url: metadata.url });
+          break;
+        }
+
+        case "open_setting": {
+          const metadata = settingMetadata(selected);
+
+          if (!metadata) {
+            failSelectedAction(action);
+            return;
+          }
+
+          await invoke("open_setting", { settingId: metadata.setting_id });
+          break;
+        }
+
+        case "reuse_query": {
+          const metadata = historyMetadata(selected);
+
+          if (!metadata) {
+            failSelectedAction(action);
+            return;
+          }
+
+          query = metadata.query;
+          searchError = null;
+          actionError = null;
           focusSearchInput();
           return;
         }
-
-        await invoke(action, { path: selected.path });
       }
 
+      recordSearchHistory(queryBeforeAction);
       query = "";
       results = [];
       selectedIndex = -1;
