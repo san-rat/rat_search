@@ -1,8 +1,9 @@
 use std::{
     path::{Path, PathBuf},
+    process::Command,
     sync::{Arc, RwLock},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Size, WebviewWindow};
@@ -28,6 +29,7 @@ use file_actions::ValidatedPath;
 use file_index::FileIndex;
 use search_history::SearchHistory;
 use search_result::{SearchResult, SearchSource};
+use settings_search::PreparedSettingCommand;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
 
@@ -288,6 +290,14 @@ fn path_for_opener(path: &std::path::Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+fn validate_copy_text(text: &str) -> Result<&str, String> {
+    if text.trim().is_empty() {
+        return Err("Text is required".to_owned());
+    }
+
+    Ok(text)
+}
+
 fn history_file_path_from_data_dir(data_dir: &Path) -> PathBuf {
     data_dir.join(SEARCH_HISTORY_FILE_NAME)
 }
@@ -318,7 +328,13 @@ fn load_search_history_state(app: &tauri::AppHandle) -> SearchHistoryState {
     Arc::new(RwLock::new(history))
 }
 
-#[allow(dead_code)]
+fn current_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
 fn record_search_history_in_state(
     state: &SearchHistoryState,
     query: &str,
@@ -336,6 +352,25 @@ fn record_search_history_in_state(
     history
         .save()
         .map_err(|_| "Could not save search history".to_owned())
+}
+
+fn prepare_setting_command(setting_id: &str) -> Result<PreparedSettingCommand, String> {
+    settings_search::command_for_setting(setting_id).ok_or_else(|| "Could not open item".to_owned())
+}
+
+fn spawn_setting_command(command: &PreparedSettingCommand) -> Result<(), String> {
+    Command::new(&command.program)
+        .args(&command.args)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| {
+            eprintln!(
+                "failed to open setting with '{} {}': {error}",
+                command.program,
+                command.args.join(" ")
+            );
+            "Could not open item".to_owned()
+        })
 }
 
 #[tauri::command]
@@ -400,6 +435,51 @@ fn copy_path(
         })?;
 
     hide_launcher_for_app(&app)
+}
+
+#[tauri::command]
+fn copy_text(app: tauri::AppHandle, text: String) -> Result<(), String> {
+    let text = validate_copy_text(&text)?;
+
+    app.clipboard()
+        .write_text(text.to_owned())
+        .map_err(|error| {
+            eprintln!("failed to copy text: {error}");
+            "Could not complete action".to_owned()
+        })?;
+
+    hide_launcher_for_app(&app)
+}
+
+#[tauri::command]
+fn open_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    if !web_shortcuts::is_allowed_url(&url) {
+        return Err("Could not open item".to_owned());
+    }
+
+    app.opener().open_url(url, None::<&str>).map_err(|error| {
+        eprintln!("failed to open url: {error}");
+        "Could not open item".to_owned()
+    })?;
+
+    hide_launcher_for_app(&app)
+}
+
+#[tauri::command]
+fn open_setting(app: tauri::AppHandle, setting_id: String) -> Result<(), String> {
+    let command = prepare_setting_command(&setting_id)?;
+
+    spawn_setting_command(&command)?;
+
+    hide_launcher_for_app(&app)
+}
+
+#[tauri::command]
+fn record_search_history(
+    history: tauri::State<'_, SearchHistoryState>,
+    query: String,
+) -> Result<(), String> {
+    record_search_history_in_state(&history, &query, current_time_ms())
 }
 
 fn start_file_index_scan(file_index: FileIndexState) {
@@ -559,9 +639,13 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             close_launcher,
             copy_path,
+            copy_text,
             hide_launcher,
             launch_app,
             open_path,
+            open_setting,
+            open_url,
+            record_search_history,
             reveal_path,
             search,
             set_launcher_expanded
@@ -689,6 +773,34 @@ mod tests {
         assert_eq!(
             history_file_path_from_data_dir(Path::new("/tmp/rat-search-data")),
             PathBuf::from("/tmp/rat-search-data").join(SEARCH_HISTORY_FILE_NAME)
+        );
+    }
+
+    #[test]
+    fn copy_text_validation_rejects_empty_text() {
+        assert_eq!(
+            validate_copy_text("   ").expect_err("empty copy text should be rejected"),
+            "Text is required"
+        );
+        assert_eq!(
+            validate_copy_text(" calculator result ").expect("text should validate"),
+            " calculator result "
+        );
+    }
+
+    #[test]
+    fn prepare_setting_command_resolves_known_ids_and_rejects_unknown_ids() {
+        assert_eq!(
+            prepare_setting_command("wifi").expect("wifi setting should resolve"),
+            PreparedSettingCommand {
+                program: "gnome-control-center".to_owned(),
+                args: vec!["wifi".to_owned()],
+            }
+        );
+        assert_eq!(
+            prepare_setting_command("definitely-not-a-setting")
+                .expect_err("unknown setting should be rejected"),
+            "Could not open item"
         );
     }
 

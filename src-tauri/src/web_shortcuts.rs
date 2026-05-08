@@ -41,6 +41,20 @@ pub(crate) fn search_web_shortcuts(query: &str, limit: usize) -> Vec<SearchResul
     }]
 }
 
+pub(crate) fn is_allowed_url(url: &str) -> bool {
+    if url.as_bytes().iter().any(|byte| byte.is_ascii_whitespace()) {
+        return false;
+    }
+
+    supported_url_prefixes().iter().any(|prefix| {
+        let Some(encoded_query) = url.strip_prefix(prefix) else {
+            return false;
+        };
+
+        !encoded_query.is_empty() && is_valid_generated_query(encoded_query)
+    })
+}
+
 fn parse_shortcut_query(query: &str) -> Option<(&str, &str)> {
     let query = query.trim();
     let separator_index = query.find(char::is_whitespace)?;
@@ -78,6 +92,42 @@ fn percent_encode(value: &str) -> String {
     encoded
 }
 
+fn supported_url_prefixes() -> [&'static str; 5] {
+    [
+        WebUrlTemplate::Google.url_prefix(),
+        WebUrlTemplate::Wikipedia.url_prefix(),
+        WebUrlTemplate::YouTube.url_prefix(),
+        WebUrlTemplate::GitHub.url_prefix(),
+        WebUrlTemplate::Maps.url_prefix(),
+    ]
+}
+
+fn is_valid_generated_query(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len()
+                && is_upper_hex_digit(bytes[index + 1])
+                && is_upper_hex_digit(bytes[index + 2]) =>
+            {
+                index += 3;
+            }
+            _ => return false,
+        }
+    }
+
+    true
+}
+
+fn is_upper_hex_digit(byte: u8) -> bool {
+    byte.is_ascii_digit() || matches!(byte, b'A'..=b'F')
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WebShortcut {
     label: &'static str,
@@ -90,23 +140,7 @@ impl WebShortcut {
     }
 
     fn url_for(&self, encoded_query: &str) -> String {
-        match self.template {
-            WebUrlTemplate::Google => {
-                format!("https://www.google.com/search?q={encoded_query}")
-            }
-            WebUrlTemplate::Wikipedia => {
-                format!("https://en.wikipedia.org/wiki/Special:Search?search={encoded_query}")
-            }
-            WebUrlTemplate::YouTube => {
-                format!("https://www.youtube.com/results?search_query={encoded_query}")
-            }
-            WebUrlTemplate::GitHub => {
-                format!("https://github.com/search?q={encoded_query}")
-            }
-            WebUrlTemplate::Maps => {
-                format!("https://www.google.com/maps/search/{encoded_query}")
-            }
-        }
+        format!("{}{encoded_query}", self.template.url_prefix())
     }
 }
 
@@ -117,6 +151,18 @@ enum WebUrlTemplate {
     YouTube,
     GitHub,
     Maps,
+}
+
+impl WebUrlTemplate {
+    fn url_prefix(&self) -> &'static str {
+        match self {
+            WebUrlTemplate::Google => "https://www.google.com/search?q=",
+            WebUrlTemplate::Wikipedia => "https://en.wikipedia.org/wiki/Special:Search?search=",
+            WebUrlTemplate::YouTube => "https://www.youtube.com/results?search_query=",
+            WebUrlTemplate::GitHub => "https://github.com/search?q=",
+            WebUrlTemplate::Maps => "https://www.google.com/maps/search/",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -187,6 +233,41 @@ mod tests {
             metadata_url(&result),
             "https://www.google.com/search?q=caf%C3%A9%20%26%20rust"
         );
+    }
+
+    #[test]
+    fn generated_web_urls_are_allowed() {
+        for query in [
+            "? rust tauri",
+            "w rust language",
+            "yt lofi beats",
+            "gh tauri apps",
+            "maps café & rust",
+        ] {
+            let result = web_result(query).expect("web result");
+
+            assert!(
+                is_allowed_url(metadata_url(&result)),
+                "{query} should be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_web_urls_are_rejected() {
+        for url in [
+            "http://www.google.com/search?q=rust",
+            "https://example.com/search?q=rust",
+            "https://www.google.com/search?q=",
+            "https://www.google.com/search?q=rust&source=rat",
+            "https://www.google.com/search?q=rust tauri",
+            "https://github.com/search?q=rust%2ftauri",
+            "https://github.com/search?q=rust%",
+            "https://github.com/search?q=rust%2",
+            "https://github.com/search?q=rust%XZ",
+        ] {
+            assert!(!is_allowed_url(url), "{url} should be rejected");
+        }
     }
 
     #[test]
