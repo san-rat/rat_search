@@ -297,6 +297,14 @@
         return "symbolic-icon symbolic-file symbolic-file-archive";
       case "file-document":
         return "symbolic-icon symbolic-file symbolic-file-document";
+      case "calculator":
+        return "symbolic-icon symbolic-calculator";
+      case "web":
+        return "symbolic-icon symbolic-web";
+      case "settings":
+        return "symbolic-icon symbolic-settings";
+      case "history":
+        return "symbolic-icon symbolic-history";
       default:
         return null;
     }
@@ -998,6 +1006,122 @@
 
   .symbolic-file-document::before {
     color: rgba(44, 111, 184, 0.9);
+  }
+
+  .symbolic-calculator {
+    width: 18px;
+    height: 21px;
+  }
+
+  .symbolic-calculator::before {
+    content: "";
+    position: absolute;
+    inset: 1px 2px;
+    border: 1.7px solid currentColor;
+    border-radius: 3px;
+    opacity: 0.82;
+  }
+
+  .symbolic-calculator::after {
+    content: "";
+    position: absolute;
+    top: 5px;
+    left: 6px;
+    width: 6px;
+    height: 2px;
+    border-radius: 1px;
+    background: currentColor;
+    box-shadow:
+      -2px 6px 0 currentColor,
+      4px 6px 0 currentColor,
+      -2px 10px 0 currentColor,
+      4px 10px 0 currentColor;
+    opacity: 0.78;
+  }
+
+  .symbolic-web {
+    width: 21px;
+    height: 21px;
+  }
+
+  .symbolic-web::before {
+    content: "";
+    position: absolute;
+    inset: 2px;
+    border: 1.8px solid currentColor;
+    border-radius: 50%;
+    opacity: 0.78;
+  }
+
+  .symbolic-web::after {
+    content: "";
+    position: absolute;
+    top: 5px;
+    right: 2px;
+    bottom: 5px;
+    left: 2px;
+    border-top: 1.6px solid currentColor;
+    border-bottom: 1.6px solid currentColor;
+    box-shadow:
+      inset 5px 0 0 -3.5px currentColor,
+      inset -5px 0 0 -3.5px currentColor;
+    opacity: 0.72;
+  }
+
+  .symbolic-settings {
+    width: 20px;
+    height: 20px;
+  }
+
+  .symbolic-settings::before {
+    content: "";
+    position: absolute;
+    inset: 4px;
+    border: 2px solid currentColor;
+    border-radius: 50%;
+    box-shadow:
+      0 -6px 0 -2px currentColor,
+      0 6px 0 -2px currentColor,
+      -6px 0 0 -2px currentColor,
+      6px 0 0 -2px currentColor;
+    opacity: 0.78;
+  }
+
+  .symbolic-settings::after {
+    content: "";
+    position: absolute;
+    inset: 8px;
+    border-radius: 50%;
+    background: currentColor;
+    opacity: 0.78;
+  }
+
+  .symbolic-history {
+    width: 21px;
+    height: 21px;
+  }
+
+  .symbolic-history::before {
+    content: "";
+    position: absolute;
+    inset: 2px;
+    border: 1.8px solid currentColor;
+    border-left-color: transparent;
+    border-radius: 50%;
+    opacity: 0.78;
+  }
+
+  .symbolic-history::after {
+    content: "";
+    position: absolute;
+    top: 5px;
+    left: 9px;
+    width: 6px;
+    height: 6px;
+    border-left: 1.8px solid currentColor;
+    border-bottom: 1.8px solid currentColor;
+    border-radius: 0 0 0 2px;
+    opacity: 0.78;
   }
 
   .result-copy {
