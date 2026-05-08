@@ -430,6 +430,7 @@ fn start_file_index_scan(file_index: FileIndexState) {
 fn search_all(
     catalog: &AppCatalog,
     file_index: Option<&FileIndex>,
+    history: Option<&SearchHistory>,
     query: &str,
     limit: usize,
 ) -> Vec<SearchResult> {
@@ -438,6 +439,14 @@ fn search_all(
 
     if let Some(file_index) = file_index {
         results.extend(file_search::search_files(file_index, query, limit));
+    }
+
+    results.extend(calculator::search_calculator(query, limit));
+    results.extend(web_shortcuts::search_web_shortcuts(query, limit));
+    results.extend(settings_search::search_settings(query, limit));
+
+    if let Some(history) = history {
+        results.extend(search_history::search_history(history, query, limit));
     }
 
     results.sort_by(compare_search_results);
@@ -478,16 +487,32 @@ fn normalize_search_text(value: &str) -> String {
 fn search(
     catalog: tauri::State<'_, AppCatalog>,
     file_index: tauri::State<'_, FileIndexState>,
+    history: tauri::State<'_, SearchHistoryState>,
     query: String,
     limit: usize,
 ) -> Vec<SearchResult> {
-    match file_index.read() {
-        Ok(index) => search_all(&catalog, Some(&index), &query, limit),
+    let file_index_guard = match file_index.read() {
+        Ok(index) => Some(index),
         Err(error) => {
             eprintln!("failed to read file index for search: {error}");
-            search_all(&catalog, None, &query, limit)
+            None
         }
-    }
+    };
+    let history_guard = match history.read() {
+        Ok(history) => Some(history),
+        Err(error) => {
+            eprintln!("failed to read search history for search: {error}");
+            None
+        }
+    };
+
+    search_all(
+        &catalog,
+        file_index_guard.as_deref(),
+        history_guard.as_deref(),
+        &query,
+        limit,
+    )
 }
 
 #[tauri::command]
@@ -630,6 +655,18 @@ mod tests {
         FileIndex::from_records(records)
     }
 
+    fn history(entries: &[(&str, u64, u32)]) -> SearchHistory {
+        let mut history = SearchHistory::load(PathBuf::from("/tmp/history.json"));
+
+        for (query, last_used_ms, use_count) in entries {
+            for offset in 0..*use_count {
+                history.record_query_at(query, last_used_ms + u64::from(offset));
+            }
+        }
+
+        history
+    }
+
     fn temporary_directory(name: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -709,7 +746,7 @@ mod tests {
         let app_catalog = catalog(vec![app("report.desktop", "Report")]);
         let file_index = index(vec![file("/home/sanuk/Documents/Annual Report.pdf")]);
 
-        let results = search_all(&app_catalog, Some(&file_index), "report", 8);
+        let results = search_all(&app_catalog, Some(&file_index), None, "report", 8);
 
         assert_eq!(results[0].source, SearchSource::Applications);
         assert_eq!(results[0].title, "Report");
@@ -724,7 +761,7 @@ mod tests {
             folder("/home/sanuk/Documents/Reports"),
         ]);
 
-        let results = search_all(&app_catalog, Some(&file_index), "report", 1);
+        let results = search_all(&app_catalog, Some(&file_index), None, "report", 1);
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Reports");
@@ -739,7 +776,7 @@ mod tests {
         let second_file = file("/home/sanuk/Documents/Beta");
         let file_index = index(vec![second_file, first_file, folder]);
 
-        let results = search_all(&app_catalog, Some(&file_index), "alpha", 8);
+        let results = search_all(&app_catalog, Some(&file_index), None, "alpha", 8);
 
         assert_eq!(
             results
@@ -757,9 +794,107 @@ mod tests {
     fn mixed_search_falls_back_to_apps_without_file_index() {
         let app_catalog = catalog(vec![app("settings.desktop", "Settings")]);
 
-        let results = search_all(&app_catalog, None, "settings", 8);
+        let results = search_all(&app_catalog, None, None, "settings", 8);
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].source, SearchSource::Applications);
+    }
+
+    #[test]
+    fn mixed_search_includes_calculator_above_weak_file_matches() {
+        let app_catalog = AppCatalog::default();
+        let file_index = index(vec![file("/home/sanuk/Documents/2 plus 2 notes.txt")]);
+
+        let results = search_all(&app_catalog, Some(&file_index), None, "2+2", 8);
+
+        assert_eq!(results[0].source, SearchSource::Calculator);
+        assert_eq!(results[0].title, "4");
+    }
+
+    #[test]
+    fn mixed_search_keeps_exact_app_above_web_and_history_results() {
+        let app_catalog = catalog(vec![app("g-rust.desktop", "g rust")]);
+        let history = history(&[("g rust", 1_700, 10)]);
+
+        let results = search_all(&app_catalog, None, Some(&history), "g rust", 8);
+
+        assert_eq!(results[0].source, SearchSource::Applications);
+        assert_eq!(results[0].title, "g rust");
+        assert!(results
+            .iter()
+            .any(|result| result.source == SearchSource::Web));
+        assert!(results
+            .iter()
+            .any(|result| result.source == SearchSource::History));
+    }
+
+    #[test]
+    fn mixed_search_includes_settings_exact_match() {
+        let app_catalog = AppCatalog::default();
+
+        let results = search_all(&app_catalog, None, None, "wifi", 8);
+
+        assert_eq!(results[0].source, SearchSource::Settings);
+        assert_eq!(results[0].title, "Wi-Fi");
+    }
+
+    #[test]
+    fn mixed_search_includes_explicit_web_shortcuts() {
+        let app_catalog = AppCatalog::default();
+
+        let results = search_all(&app_catalog, None, None, "g rust tauri", 8);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source, SearchSource::Web);
+        assert_eq!(results[0].title, "Search Google");
+    }
+
+    #[test]
+    fn mixed_search_keeps_history_below_strong_live_results() {
+        let app_catalog = AppCatalog::default();
+        let history = history(&[("wifi troubleshooting", 1_700, 20)]);
+
+        let results = search_all(&app_catalog, None, Some(&history), "wifi", 8);
+
+        assert_eq!(results[0].source, SearchSource::Settings);
+        assert_eq!(results[0].title, "Wi-Fi");
+        assert!(
+            results
+                .iter()
+                .position(|result| result.source == SearchSource::History)
+                .expect("history result should exist")
+                > 0
+        );
+    }
+
+    #[test]
+    fn mixed_search_applies_final_limit_after_all_v0_3_sources() {
+        let app_catalog = catalog(vec![app("wifi.desktop", "WiFi Utility")]);
+        let history = history(&[("wifi history", 1_700, 3)]);
+
+        let results = search_all(&app_catalog, None, Some(&history), "wifi", 2);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.source.clone())
+                .collect::<Vec<_>>(),
+            [SearchSource::Applications, SearchSource::Settings]
+        );
+    }
+
+    #[test]
+    fn mixed_search_falls_back_when_history_is_absent() {
+        let app_catalog = AppCatalog::default();
+
+        let results = search_all(&app_catalog, None, None, "wifi", 8);
+
+        assert!(results
+            .iter()
+            .any(|result| result.source == SearchSource::Settings));
+        assert!(!results
+            .iter()
+            .any(|result| result.source == SearchSource::History));
     }
 }
