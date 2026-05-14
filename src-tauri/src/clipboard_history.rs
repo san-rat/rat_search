@@ -214,6 +214,28 @@ impl ClipboardHistory {
         self.entries.len() != before_len
     }
 
+    pub(crate) fn item_text(&self, item_id: &str) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|entry| entry.id == item_id)
+            .map(|entry| entry.text.as_str())
+    }
+
+    pub(crate) fn mark_item_used_at(&mut self, item_id: &str, used_at_ms: u64) -> bool {
+        let Some(index) = self.entries.iter().position(|entry| entry.id == item_id) else {
+            return false;
+        };
+
+        let mut entry = self.entries.remove(index);
+        entry.last_used_ms = Some(used_at_ms);
+        entry.use_count = entry.use_count.saturating_add(1);
+        entry.copied_at_ms = used_at_ms;
+        self.entries.insert(0, entry);
+        self.sort_entries();
+
+        true
+    }
+
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
     }

@@ -6,6 +6,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use serde::Serialize;
 use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Size, WebviewWindow};
 
 mod app_discovery;
@@ -41,6 +42,15 @@ type FileIndexState = Arc<RwLock<FileIndex>>;
 type ClipboardHistoryState = Arc<RwLock<ClipboardHistory>>;
 type ClipboardSettingsState = Arc<RwLock<ClipboardSettings>>;
 type SearchHistoryState = Arc<RwLock<SearchHistory>>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ClipboardPrivacyStatus {
+    enabled: bool,
+    entry_count: usize,
+    retention_days: u32,
+    max_entries: u32,
+    max_text_bytes: u32,
+}
 
 const LAUNCHER_WINDOW_LABEL: &str = "main";
 const LAUNCHER_SHOWN_EVENT: &str = "launcher:shown";
@@ -487,6 +497,101 @@ fn record_clipboard_text_in_state(
     Ok(outcome)
 }
 
+fn set_clipboard_history_enabled_in_state(
+    settings: &ClipboardSettingsState,
+    enabled: bool,
+    now_ms: u64,
+) -> Result<(), String> {
+    let mut settings = settings
+        .write()
+        .map_err(|_| "Clipboard settings unavailable".to_owned())?;
+
+    settings.set_enabled(enabled, now_ms);
+    settings
+        .save()
+        .map_err(|_| "Could not save clipboard settings".to_owned())
+}
+
+fn clear_clipboard_history_in_state(history: &ClipboardHistoryState) -> Result<(), String> {
+    let mut history = history
+        .write()
+        .map_err(|_| "Clipboard history unavailable".to_owned())?;
+
+    history.clear();
+    history
+        .save()
+        .map_err(|_| "Could not save clipboard history".to_owned())
+}
+
+fn delete_clipboard_item_in_state(
+    history: &ClipboardHistoryState,
+    item_id: &str,
+) -> Result<(), String> {
+    let mut history = history
+        .write()
+        .map_err(|_| "Clipboard history unavailable".to_owned())?;
+
+    if !history.delete_item(item_id) {
+        return Err("Could not complete action".to_owned());
+    }
+
+    history
+        .save()
+        .map_err(|_| "Could not save clipboard history".to_owned())
+}
+
+fn clipboard_item_text_from_state(
+    history: &ClipboardHistoryState,
+    item_id: &str,
+) -> Result<String, String> {
+    let history = history
+        .read()
+        .map_err(|_| "Clipboard history unavailable".to_owned())?;
+
+    history
+        .item_text(item_id)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| "Could not complete action".to_owned())
+}
+
+fn mark_clipboard_item_copied_in_state(
+    history: &ClipboardHistoryState,
+    item_id: &str,
+    now_ms: u64,
+) -> Result<(), String> {
+    let mut history = history
+        .write()
+        .map_err(|_| "Clipboard history unavailable".to_owned())?;
+
+    if !history.mark_item_used_at(item_id, now_ms) {
+        return Err("Could not complete action".to_owned());
+    }
+
+    history
+        .save()
+        .map_err(|_| "Could not save clipboard history".to_owned())
+}
+
+fn clipboard_privacy_status_from_state(
+    settings: &ClipboardSettingsState,
+    history: &ClipboardHistoryState,
+) -> Result<ClipboardPrivacyStatus, String> {
+    let settings = settings
+        .read()
+        .map_err(|_| "Clipboard settings unavailable".to_owned())?;
+    let history = history
+        .read()
+        .map_err(|_| "Clipboard history unavailable".to_owned())?;
+
+    Ok(ClipboardPrivacyStatus {
+        enabled: settings.is_enabled(),
+        entry_count: history.entries().len(),
+        retention_days: settings.retention_days(),
+        max_entries: settings.max_entries(),
+        max_text_bytes: settings.max_text_bytes(),
+    })
+}
+
 fn current_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -608,6 +713,58 @@ fn copy_text(app: tauri::AppHandle, text: String) -> Result<(), String> {
         })?;
 
     hide_launcher_for_app(&app)
+}
+
+#[tauri::command]
+fn enable_clipboard_history(
+    settings: tauri::State<'_, ClipboardSettingsState>,
+) -> Result<(), String> {
+    set_clipboard_history_enabled_in_state(&settings, true, current_time_ms())
+}
+
+#[tauri::command]
+fn disable_clipboard_history(
+    settings: tauri::State<'_, ClipboardSettingsState>,
+) -> Result<(), String> {
+    set_clipboard_history_enabled_in_state(&settings, false, current_time_ms())
+}
+
+#[tauri::command]
+fn clear_clipboard_history(history: tauri::State<'_, ClipboardHistoryState>) -> Result<(), String> {
+    clear_clipboard_history_in_state(&history)
+}
+
+#[tauri::command]
+fn delete_clipboard_item(
+    history: tauri::State<'_, ClipboardHistoryState>,
+    item_id: String,
+) -> Result<(), String> {
+    delete_clipboard_item_in_state(&history, &item_id)
+}
+
+#[tauri::command]
+fn copy_clipboard_item(
+    app: tauri::AppHandle,
+    history: tauri::State<'_, ClipboardHistoryState>,
+    item_id: String,
+) -> Result<(), String> {
+    let text = clipboard_item_text_from_state(&history, &item_id)?;
+
+    app.clipboard().write_text(text).map_err(|error| {
+        eprintln!("failed to copy clipboard history item: {error}");
+        "Could not complete action".to_owned()
+    })?;
+
+    mark_clipboard_item_copied_in_state(&history, &item_id, current_time_ms())?;
+    hide_launcher_for_app(&app)
+}
+
+#[tauri::command]
+fn get_clipboard_privacy_status(
+    settings: tauri::State<'_, ClipboardSettingsState>,
+    history: tauri::State<'_, ClipboardHistoryState>,
+) -> Result<ClipboardPrivacyStatus, String> {
+    clipboard_privacy_status_from_state(&settings, &history)
 }
 
 #[tauri::command]
@@ -828,8 +985,14 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             close_launcher,
+            clear_clipboard_history,
+            copy_clipboard_item,
             copy_path,
             copy_text,
+            delete_clipboard_item,
+            disable_clipboard_history,
+            enable_clipboard_history,
+            get_clipboard_privacy_status,
             hide_launcher,
             launch_app,
             open_path,
@@ -1080,6 +1243,181 @@ mod tests {
             fs::read_to_string(capability_path).expect("default capability should be readable");
 
         assert!(contents.contains("\"clipboard-manager:allow-read-text\""));
+    }
+
+    #[test]
+    fn clipboard_history_enable_and_disable_helpers_persist_settings() {
+        let root = temporary_directory("clipboard-enable-disable");
+        let path = root.join("clipboard-settings.json");
+        let settings = clipboard_settings_state(path.clone(), false);
+
+        set_clipboard_history_enabled_in_state(&settings, true, 2_000)
+            .expect("settings should be enabled");
+        let enabled_file: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("settings should be readable"))
+                .expect("settings json should parse");
+        assert_eq!(enabled_file["enabled"], true);
+        assert_eq!(enabled_file["updated_at_ms"], 2_000);
+
+        set_clipboard_history_enabled_in_state(&settings, false, 3_000)
+            .expect("settings should be disabled");
+        let disabled_file: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("settings should be readable"))
+                .expect("settings json should parse");
+        assert_eq!(disabled_file["enabled"], false);
+        assert_eq!(disabled_file["updated_at_ms"], 3_000);
+
+        fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn clipboard_privacy_status_returns_counts_and_limits_without_text() {
+        let settings_root = temporary_directory("clipboard-status-settings");
+        let history_root = temporary_directory("clipboard-status-history");
+        let settings =
+            clipboard_settings_state(settings_root.join("clipboard-settings.json"), true);
+        let history_path = history_root.join("clipboard-history.json");
+        let history = clipboard_history_state(history_path.clone());
+        record_clipboard_text_in_state(&settings, &history, "ordinary clipboard text", 1_700)
+            .expect("clipboard text should be recorded");
+
+        let status = clipboard_privacy_status_from_state(&settings, &history)
+            .expect("status should be returned");
+        let status_json = serde_json::to_value(&status).expect("status should serialize");
+
+        assert_eq!(status.enabled, true);
+        assert_eq!(status.entry_count, 1);
+        assert_eq!(status.retention_days, 7);
+        assert_eq!(status.max_entries, 100);
+        assert_eq!(status.max_text_bytes, 10_000);
+        assert_eq!(status_json.get("text"), None);
+        assert_eq!(status_json.get("preview"), None);
+        assert_eq!(status_json.get("item_id"), None);
+
+        fs::remove_dir_all(settings_root).expect("temporary directory should be removed");
+        fs::remove_dir_all(history_root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn clear_clipboard_history_helper_removes_entries_and_persists() {
+        let settings_root = temporary_directory("clipboard-clear-settings");
+        let history_root = temporary_directory("clipboard-clear-history");
+        let settings =
+            clipboard_settings_state(settings_root.join("clipboard-settings.json"), true);
+        let history_path = history_root.join("clipboard-history.json");
+        let history = clipboard_history_state(history_path.clone());
+        record_clipboard_text_in_state(&settings, &history, "first copied value", 1_700)
+            .expect("first clipboard text should be recorded");
+        record_clipboard_text_in_state(&settings, &history, "second copied value", 1_800)
+            .expect("second clipboard text should be recorded");
+
+        clear_clipboard_history_in_state(&history).expect("history should be cleared");
+
+        assert!(history.read().expect("history lock").entries().is_empty());
+        assert!(ClipboardHistory::load(history_path).entries().is_empty());
+
+        fs::remove_dir_all(settings_root).expect("temporary directory should be removed");
+        fs::remove_dir_all(history_root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn delete_clipboard_item_helper_removes_one_item_and_persists() {
+        let settings_root = temporary_directory("clipboard-delete-settings");
+        let history_root = temporary_directory("clipboard-delete-history");
+        let settings =
+            clipboard_settings_state(settings_root.join("clipboard-settings.json"), true);
+        let history_path = history_root.join("clipboard-history.json");
+        let history = clipboard_history_state(history_path.clone());
+        record_clipboard_text_in_state(&settings, &history, "first copied value", 1_700)
+            .expect("first clipboard text should be recorded");
+        record_clipboard_text_in_state(&settings, &history, "second copied value", 1_800)
+            .expect("second clipboard text should be recorded");
+        let item_id = history.read().expect("history lock").entries()[1]
+            .id
+            .clone();
+
+        delete_clipboard_item_in_state(&history, &item_id).expect("item should be deleted");
+
+        let loaded = ClipboardHistory::load(history_path);
+        assert_eq!(loaded.entries().len(), 1);
+        assert_ne!(loaded.entries()[0].id, item_id);
+
+        fs::remove_dir_all(settings_root).expect("temporary directory should be removed");
+        fs::remove_dir_all(history_root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn delete_clipboard_item_helper_rejects_unknown_ids() {
+        let history_root = temporary_directory("clipboard-delete-unknown");
+        let history = clipboard_history_state(history_root.join("clipboard-history.json"));
+
+        let error = delete_clipboard_item_in_state(&history, "clip:missing")
+            .expect_err("unknown item should be rejected");
+
+        assert_eq!(error, "Could not complete action");
+
+        fs::remove_dir_all(history_root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn copy_clipboard_item_helpers_return_known_text_and_update_usage() {
+        let settings_root = temporary_directory("clipboard-copy-settings");
+        let history_root = temporary_directory("clipboard-copy-history");
+        let settings =
+            clipboard_settings_state(settings_root.join("clipboard-settings.json"), true);
+        let history_path = history_root.join("clipboard-history.json");
+        let history = clipboard_history_state(history_path.clone());
+        record_clipboard_text_in_state(&settings, &history, "known copied value", 1_700)
+            .expect("clipboard text should be recorded");
+        let item_id = history.read().expect("history lock").entries()[0]
+            .id
+            .clone();
+
+        let text = clipboard_item_text_from_state(&history, &item_id)
+            .expect("known item text should be returned");
+        mark_clipboard_item_copied_in_state(&history, &item_id, 2_000)
+            .expect("known item should be marked copied");
+
+        let loaded = ClipboardHistory::load(history_path);
+        assert_eq!(text, "known copied value");
+        assert_eq!(loaded.entries()[0].id, item_id);
+        assert_eq!(loaded.entries()[0].copied_at_ms, 2_000);
+        assert_eq!(loaded.entries()[0].last_used_ms, Some(2_000));
+        assert_eq!(loaded.entries()[0].use_count, 1);
+
+        fs::remove_dir_all(settings_root).expect("temporary directory should be removed");
+        fs::remove_dir_all(history_root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn copy_clipboard_item_helpers_reject_unknown_ids() {
+        let history_root = temporary_directory("clipboard-copy-unknown");
+        let history = clipboard_history_state(history_root.join("clipboard-history.json"));
+
+        let text_error = clipboard_item_text_from_state(&history, "clip:missing")
+            .expect_err("unknown item text should be rejected");
+        let mark_error = mark_clipboard_item_copied_in_state(&history, "clip:missing", 2_000)
+            .expect_err("unknown item mark should be rejected");
+
+        assert_eq!(text_error, "Could not complete action");
+        assert_eq!(mark_error, "Could not complete action");
+
+        fs::remove_dir_all(history_root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn clipboard_history_save_failure_returns_short_error_without_text() {
+        let history_root = temporary_directory("clipboard-save-failure");
+        let history_path = history_root.join("clipboard-history.json");
+        fs::create_dir_all(&history_path).expect("directory should block file persistence");
+        let history = clipboard_history_state(history_path);
+
+        let error = clear_clipboard_history_in_state(&history)
+            .expect_err("save failure should be reported");
+
+        assert_eq!(error, "Could not save clipboard history");
+
+        fs::remove_dir_all(history_root).expect("temporary directory should be removed");
     }
 
     #[test]
