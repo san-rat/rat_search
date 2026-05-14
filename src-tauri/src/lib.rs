@@ -27,6 +27,8 @@ mod web_shortcuts;
 
 use app_discovery::AppCatalog;
 use app_launch::LaunchResult;
+use clipboard_history::ClipboardHistory;
+use clipboard_settings::ClipboardSettings;
 use file_actions::ValidatedPath;
 use file_index::FileIndex;
 use search_history::SearchHistory;
@@ -36,11 +38,15 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
 
 type FileIndexState = Arc<RwLock<FileIndex>>;
+type ClipboardHistoryState = Arc<RwLock<ClipboardHistory>>;
+type ClipboardSettingsState = Arc<RwLock<ClipboardSettings>>;
 type SearchHistoryState = Arc<RwLock<SearchHistory>>;
 
 const LAUNCHER_WINDOW_LABEL: &str = "main";
 const LAUNCHER_SHOWN_EVENT: &str = "launcher:shown";
 const TOGGLE_ARG: &str = "toggle";
+const CLIPBOARD_HISTORY_FILE_NAME: &str = "clipboard-history.json";
+const CLIPBOARD_SETTINGS_FILE_NAME: &str = "clipboard-settings.json";
 const SEARCH_HISTORY_FILE_NAME: &str = "search-history.json";
 const DELAYED_CENTER_MS: u64 = 80;
 const LAUNCHER_VERTICAL_PERCENT: u32 = 25;
@@ -304,6 +310,14 @@ fn history_file_path_from_data_dir(data_dir: &Path) -> PathBuf {
     data_dir.join(SEARCH_HISTORY_FILE_NAME)
 }
 
+fn clipboard_history_file_path_from_data_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(CLIPBOARD_HISTORY_FILE_NAME)
+}
+
+fn clipboard_settings_file_path_from_data_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(CLIPBOARD_SETTINGS_FILE_NAME)
+}
+
 fn search_history_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_data_dir()
@@ -311,10 +325,36 @@ fn search_history_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| error.to_string())
 }
 
+fn clipboard_history_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|data_dir| clipboard_history_file_path_from_data_dir(&data_dir))
+        .map_err(|error| error.to_string())
+}
+
+fn clipboard_settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|data_dir| clipboard_settings_file_path_from_data_dir(&data_dir))
+        .map_err(|error| error.to_string())
+}
+
 fn fallback_search_history_path() -> PathBuf {
     std::env::temp_dir()
         .join("rat-search")
         .join(SEARCH_HISTORY_FILE_NAME)
+}
+
+fn fallback_clipboard_history_path() -> PathBuf {
+    std::env::temp_dir()
+        .join("rat-search")
+        .join(CLIPBOARD_HISTORY_FILE_NAME)
+}
+
+fn fallback_clipboard_settings_path() -> PathBuf {
+    std::env::temp_dir()
+        .join("rat-search")
+        .join(CLIPBOARD_SETTINGS_FILE_NAME)
 }
 
 fn load_search_history_state(app: &tauri::AppHandle) -> SearchHistoryState {
@@ -328,6 +368,55 @@ fn load_search_history_state(app: &tauri::AppHandle) -> SearchHistoryState {
     dev_log(format!("loaded {entry_count} search history entries"));
 
     Arc::new(RwLock::new(history))
+}
+
+fn load_clipboard_states(
+    app: &tauri::AppHandle,
+) -> (ClipboardSettingsState, ClipboardHistoryState) {
+    let settings_path = clipboard_settings_path(app).unwrap_or_else(|error| {
+        eprintln!("failed to resolve clipboard settings path: {error}");
+        fallback_clipboard_settings_path()
+    });
+    let history_path = clipboard_history_path(app).unwrap_or_else(|error| {
+        eprintln!("failed to resolve clipboard history path: {error}");
+        fallback_clipboard_history_path()
+    });
+
+    load_clipboard_states_from_paths(settings_path, history_path, current_time_ms())
+}
+
+fn load_clipboard_states_from_paths(
+    settings_path: PathBuf,
+    history_path: PathBuf,
+    now_ms: u64,
+) -> (ClipboardSettingsState, ClipboardHistoryState) {
+    let settings = ClipboardSettings::load(settings_path);
+    let mut history = ClipboardHistory::load(history_path);
+    let before_prune_count = history.entries().len();
+
+    history.prune_expired_at(now_ms, settings.retention_days());
+
+    if history.entries().len() != before_prune_count {
+        if let Err(error) = history.save() {
+            eprintln!("failed to save pruned clipboard history: {error}");
+        }
+    }
+
+    let entry_count = history.entries().len();
+    let status = if settings.is_enabled() {
+        "enabled"
+    } else {
+        "disabled"
+    };
+
+    dev_log(format!(
+        "loaded {entry_count} clipboard history entries; clipboard history is {status}"
+    ));
+
+    (
+        Arc::new(RwLock::new(settings)),
+        Arc::new(RwLock::new(history)),
+    )
 }
 
 fn current_time_ms() -> u64 {
@@ -673,6 +762,10 @@ pub fn run() {
             let search_history = load_search_history_state(app.handle());
             app.manage(search_history);
 
+            let (clipboard_settings, clipboard_history) = load_clipboard_states(app.handle());
+            app.manage(clipboard_settings);
+            app.manage(clipboard_history);
+
             let file_index = Arc::new(RwLock::new(FileIndex::new()));
             app.manage(file_index.clone());
             start_file_index_scan(file_index);
@@ -701,6 +794,8 @@ mod tests {
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    use serde_json::json;
 
     use crate::{
         app_discovery::{AppCatalog, AppRecord},
@@ -777,6 +872,163 @@ mod tests {
             history_file_path_from_data_dir(Path::new("/tmp/rat-search-data")),
             PathBuf::from("/tmp/rat-search-data").join(SEARCH_HISTORY_FILE_NAME)
         );
+    }
+
+    #[test]
+    fn clipboard_path_helpers_append_expected_file_names() {
+        let data_dir = Path::new("/tmp/rat-search-data");
+
+        assert_eq!(
+            clipboard_history_file_path_from_data_dir(data_dir),
+            PathBuf::from("/tmp/rat-search-data").join(CLIPBOARD_HISTORY_FILE_NAME)
+        );
+        assert_eq!(
+            clipboard_settings_file_path_from_data_dir(data_dir),
+            PathBuf::from("/tmp/rat-search-data").join(CLIPBOARD_SETTINGS_FILE_NAME)
+        );
+    }
+
+    #[test]
+    fn clipboard_fallback_paths_use_temp_rat_search_directory() {
+        assert_eq!(
+            fallback_clipboard_history_path(),
+            std::env::temp_dir()
+                .join("rat-search")
+                .join(CLIPBOARD_HISTORY_FILE_NAME)
+        );
+        assert_eq!(
+            fallback_clipboard_settings_path(),
+            std::env::temp_dir()
+                .join("rat-search")
+                .join(CLIPBOARD_SETTINGS_FILE_NAME)
+        );
+    }
+
+    #[test]
+    fn load_clipboard_states_from_paths_tolerates_missing_files() {
+        let root = temporary_directory("missing-clipboard-state");
+        let settings_path = root.join("clipboard-settings.json");
+        let history_path = root.join("clipboard-history.json");
+
+        let (settings, history) =
+            load_clipboard_states_from_paths(settings_path, history_path, 1_700);
+
+        assert!(!settings.read().expect("settings lock").is_enabled());
+        assert!(history.read().expect("history lock").entries().is_empty());
+
+        fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn load_clipboard_states_from_paths_prunes_expired_entries() {
+        let root = temporary_directory("pruned-clipboard-state");
+        let settings_path = root.join("clipboard-settings.json");
+        let history_path = root.join("clipboard-history.json");
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "enabled": true,
+                "max_entries": 100,
+                "max_text_bytes": 10000,
+                "retention_days": 1,
+                "updated_at_ms": 1_700
+            }))
+            .expect("settings should serialize"),
+        )
+        .expect("settings should be written");
+        fs::write(
+            &history_path,
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "entries": [
+                    {
+                        "id": "clip:old",
+                        "text": "old",
+                        "normalized_text": "old",
+                        "preview": "old",
+                        "copied_at_ms": 1_000_u64,
+                        "last_used_ms": null,
+                        "use_count": 0,
+                        "text_len": 3
+                    },
+                    {
+                        "id": "clip:fresh",
+                        "text": "fresh",
+                        "normalized_text": "fresh",
+                        "preview": "fresh",
+                        "copied_at_ms": 86_401_000_u64,
+                        "last_used_ms": null,
+                        "use_count": 0,
+                        "text_len": 5
+                    }
+                ]
+            }))
+            .expect("history should serialize"),
+        )
+        .expect("history should be written");
+
+        let (_, history) =
+            load_clipboard_states_from_paths(settings_path, history_path.clone(), 172_801_000);
+        let history = history.read().expect("history lock");
+
+        assert_eq!(history.entries().len(), 1);
+        assert_eq!(history.entries()[0].id, "clip:fresh");
+        drop(history);
+
+        let persisted = clipboard_history::ClipboardHistory::load(history_path);
+        assert_eq!(persisted.entries().len(), 1);
+        assert_eq!(persisted.entries()[0].id, "clip:fresh");
+
+        fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn load_clipboard_states_from_paths_preserves_non_expired_entries() {
+        let root = temporary_directory("fresh-clipboard-state");
+        let settings_path = root.join("clipboard-settings.json");
+        let history_path = root.join("clipboard-history.json");
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "enabled": false,
+                "max_entries": 100,
+                "max_text_bytes": 10000,
+                "retention_days": 7,
+                "updated_at_ms": 1_700
+            }))
+            .expect("settings should serialize"),
+        )
+        .expect("settings should be written");
+        fs::write(
+            &history_path,
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "entries": [
+                    {
+                        "id": "clip:fresh",
+                        "text": "fresh",
+                        "normalized_text": "fresh",
+                        "preview": "fresh",
+                        "copied_at_ms": 1_000_u64,
+                        "last_used_ms": null,
+                        "use_count": 0,
+                        "text_len": 5
+                    }
+                ]
+            }))
+            .expect("history should serialize"),
+        )
+        .expect("history should be written");
+
+        let (_, history) = load_clipboard_states_from_paths(settings_path, history_path, 2_000);
+        let history = history.read().expect("history lock");
+
+        assert_eq!(history.entries().len(), 1);
+        assert_eq!(history.entries()[0].id, "clip:fresh");
+
+        fs::remove_dir_all(root).expect("temporary directory should be removed");
     }
 
     #[test]
