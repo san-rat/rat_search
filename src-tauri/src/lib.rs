@@ -13,6 +13,8 @@ mod app_icons;
 mod app_launch;
 mod app_search;
 mod calculator;
+mod clipboard_history;
+mod clipboard_settings;
 mod file_actions;
 mod file_icons;
 mod file_index;
@@ -551,7 +553,8 @@ fn source_priority(source: &SearchSource) -> u8 {
         SearchSource::Folders => 3,
         SearchSource::Files => 4,
         SearchSource::Web => 5,
-        SearchSource::History => 6,
+        SearchSource::Clipboard => 6,
+        SearchSource::History => 7,
     }
 }
 
@@ -899,6 +902,14 @@ mod tests {
                 (SearchSource::Folders, "Alpha"),
                 (SearchSource::Files, "Alpha")
             ]
+        );
+    }
+
+    #[test]
+    fn source_priority_places_clipboard_between_web_and_history() {
+        assert!(source_priority(&SearchSource::Web) < source_priority(&SearchSource::Clipboard));
+        assert!(
+            source_priority(&SearchSource::Clipboard) < source_priority(&SearchSource::History)
         );
     }
 

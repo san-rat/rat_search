@@ -10,6 +10,7 @@ pub(crate) enum SearchSource {
     Folders,
     Calculator,
     Web,
+    Clipboard,
     Settings,
     History,
 }
@@ -22,6 +23,8 @@ pub(crate) enum SearchAction {
     RevealPath,
     CopyPath,
     CopyText,
+    CopyClipboardText,
+    DeleteClipboardItem,
     OpenUrl,
     OpenSetting,
     ReuseQuery,
@@ -61,6 +64,14 @@ pub(crate) enum SearchMetadata {
         shortcut: String,
         query: String,
         url: String,
+    },
+    Clipboard {
+        item_id: String,
+        preview: String,
+        copied_at_ms: u64,
+        last_used_ms: Option<u64>,
+        use_count: u32,
+        text_len: usize,
     },
     Setting {
         setting_id: String,
@@ -103,6 +114,10 @@ mod tests {
             json!("web")
         );
         assert_eq!(
+            serde_json::to_value(SearchSource::Clipboard).expect("source should serialize"),
+            json!("clipboard")
+        );
+        assert_eq!(
             serde_json::to_value(SearchSource::Settings).expect("source should serialize"),
             json!("settings")
         );
@@ -133,6 +148,15 @@ mod tests {
         assert_eq!(
             serde_json::to_value(SearchAction::CopyText).expect("action should serialize"),
             json!("copy_text")
+        );
+        assert_eq!(
+            serde_json::to_value(SearchAction::CopyClipboardText).expect("action should serialize"),
+            json!("copy_clipboard_text")
+        );
+        assert_eq!(
+            serde_json::to_value(SearchAction::DeleteClipboardItem)
+                .expect("action should serialize"),
+            json!("delete_clipboard_item")
         );
         assert_eq!(
             serde_json::to_value(SearchAction::OpenUrl).expect("action should serialize"),
@@ -251,6 +275,30 @@ mod tests {
                 "setting_id": "wifi",
                 "panel": "wifi",
                 "command": "gnome-control-center wifi"
+            })
+        );
+    }
+
+    #[test]
+    fn clipboard_metadata_serializes_to_frontend_shape() {
+        assert_eq!(
+            serde_json::to_value(SearchMetadata::Clipboard {
+                item_id: "clip:abc123".to_owned(),
+                preview: "Copied text".to_owned(),
+                copied_at_ms: 1_700_000_000_123,
+                last_used_ms: Some(1_700_000_000_456),
+                use_count: 2,
+                text_len: 11,
+            })
+            .expect("clipboard metadata should serialize"),
+            json!({
+                "kind": "clipboard",
+                "item_id": "clip:abc123",
+                "preview": "Copied text",
+                "copied_at_ms": 1_700_000_000_123_u64,
+                "last_used_ms": 1_700_000_000_456_u64,
+                "use_count": 2,
+                "text_len": 11
             })
         );
     }
