@@ -669,6 +669,8 @@ fn start_file_index_scan(file_index: FileIndexState) {
 fn search_all(
     catalog: &AppCatalog,
     file_index: Option<&FileIndex>,
+    clipboard_settings: Option<&ClipboardSettings>,
+    clipboard_history: Option<&ClipboardHistory>,
     history: Option<&SearchHistory>,
     query: &str,
     limit: usize,
@@ -683,6 +685,16 @@ fn search_all(
     results.extend(calculator::search_calculator(query, limit));
     results.extend(web_shortcuts::search_web_shortcuts(query, limit));
     results.extend(settings_search::search_settings(query, limit));
+
+    if clipboard_settings.is_some_and(ClipboardSettings::is_enabled) {
+        if let Some(clipboard_history) = clipboard_history {
+            results.extend(clipboard_history::search_clipboard(
+                clipboard_history,
+                query,
+                limit,
+            ));
+        }
+    }
 
     if let Some(history) = history {
         results.extend(search_history::search_history(history, query, limit));
@@ -727,6 +739,8 @@ fn normalize_search_text(value: &str) -> String {
 fn search(
     catalog: tauri::State<'_, AppCatalog>,
     file_index: tauri::State<'_, FileIndexState>,
+    clipboard_settings: tauri::State<'_, ClipboardSettingsState>,
+    clipboard_history: tauri::State<'_, ClipboardHistoryState>,
     history: tauri::State<'_, SearchHistoryState>,
     query: String,
     limit: usize,
@@ -735,6 +749,20 @@ fn search(
         Ok(index) => Some(index),
         Err(error) => {
             eprintln!("failed to read file index for search: {error}");
+            None
+        }
+    };
+    let clipboard_settings_guard = match clipboard_settings.read() {
+        Ok(settings) => Some(settings),
+        Err(error) => {
+            eprintln!("failed to read clipboard settings for search: {error}");
+            None
+        }
+    };
+    let clipboard_history_guard = match clipboard_history.read() {
+        Ok(history) => Some(history),
+        Err(error) => {
+            eprintln!("failed to read clipboard history for search: {error}");
             None
         }
     };
@@ -749,6 +777,8 @@ fn search(
     search_all(
         &catalog,
         file_index_guard.as_deref(),
+        clipboard_settings_guard.as_deref(),
+        clipboard_history_guard.as_deref(),
         history_guard.as_deref(),
         &query,
         limit,
@@ -923,6 +953,45 @@ mod tests {
         }
 
         history
+    }
+
+    fn clipboard_settings(enabled: bool) -> (PathBuf, ClipboardSettings) {
+        let root = temporary_directory(if enabled {
+            "enabled-clipboard-settings"
+        } else {
+            "disabled-clipboard-settings"
+        });
+        let path = root.join("clipboard-settings.json");
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "enabled": enabled,
+                "max_entries": 100,
+                "max_text_bytes": 10000,
+                "retention_days": 7,
+                "updated_at_ms": 1_700
+            }))
+            .expect("settings should serialize"),
+        )
+        .expect("clipboard settings should be written");
+
+        (root, ClipboardSettings::load(path))
+    }
+
+    fn clipboard_history(entries: &[(&str, u64)]) -> (PathBuf, ClipboardHistory) {
+        let root = temporary_directory("clipboard-history");
+        let path = root.join("clipboard-history.json");
+        let (settings_root, settings) = clipboard_settings(true);
+        let mut history = ClipboardHistory::load(path);
+
+        for (text, copied_at_ms) in entries {
+            history.record_text_at(text, *copied_at_ms, &settings);
+        }
+
+        fs::remove_dir_all(settings_root).expect("temporary directory should be removed");
+
+        (root, history)
     }
 
     fn temporary_directory(name: &str) -> PathBuf {
@@ -1314,11 +1383,186 @@ mod tests {
     }
 
     #[test]
+    fn mixed_search_includes_clipboard_results_when_enabled() {
+        let app_catalog = AppCatalog::default();
+        let (settings_root, settings) = clipboard_settings(true);
+        let (history_root, clipboard_history) = clipboard_history(&[("alpha copied text", 1_700)]);
+
+        let results = search_all(
+            &app_catalog,
+            None,
+            Some(&settings),
+            Some(&clipboard_history),
+            None,
+            "alpha",
+            8,
+        );
+
+        assert!(results
+            .iter()
+            .any(|result| result.source == SearchSource::Clipboard));
+
+        fs::remove_dir_all(settings_root).expect("temporary directory should be removed");
+        fs::remove_dir_all(history_root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn mixed_search_excludes_clipboard_results_when_disabled() {
+        let app_catalog = AppCatalog::default();
+        let (settings_root, settings) = clipboard_settings(false);
+        let (history_root, clipboard_history) = clipboard_history(&[("alpha copied text", 1_700)]);
+
+        let results = search_all(
+            &app_catalog,
+            None,
+            Some(&settings),
+            Some(&clipboard_history),
+            None,
+            "alpha",
+            8,
+        );
+
+        assert!(!results
+            .iter()
+            .any(|result| result.source == SearchSource::Clipboard));
+
+        fs::remove_dir_all(settings_root).expect("temporary directory should be removed");
+        fs::remove_dir_all(history_root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn mixed_search_excludes_clipboard_results_for_empty_queries() {
+        let app_catalog = AppCatalog::default();
+        let (settings_root, settings) = clipboard_settings(true);
+        let (history_root, clipboard_history) = clipboard_history(&[("alpha copied text", 1_700)]);
+
+        let results = search_all(
+            &app_catalog,
+            None,
+            Some(&settings),
+            Some(&clipboard_history),
+            None,
+            "   ",
+            8,
+        );
+
+        assert!(!results
+            .iter()
+            .any(|result| result.source == SearchSource::Clipboard));
+
+        fs::remove_dir_all(settings_root).expect("temporary directory should be removed");
+        fs::remove_dir_all(history_root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn mixed_search_keeps_strong_settings_above_clipboard() {
+        let app_catalog = AppCatalog::default();
+        let (settings_root, settings) = clipboard_settings(true);
+        let (history_root, clipboard_history) = clipboard_history(&[("wifi copied text", 1_700)]);
+
+        let results = search_all(
+            &app_catalog,
+            None,
+            Some(&settings),
+            Some(&clipboard_history),
+            None,
+            "wifi",
+            8,
+        );
+
+        assert_eq!(results[0].source, SearchSource::Settings);
+        assert!(results
+            .iter()
+            .any(|result| result.source == SearchSource::Clipboard));
+
+        fs::remove_dir_all(settings_root).expect("temporary directory should be removed");
+        fs::remove_dir_all(history_root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn mixed_search_clipboard_can_rank_above_weak_history() {
+        let app_catalog = AppCatalog::default();
+        let (settings_root, settings) = clipboard_settings(true);
+        let (history_root, clipboard_history) = clipboard_history(&[("alpha copied text", 1_700)]);
+        let history = history(&[("my alpha notes", 1_000, 1)]);
+
+        let results = search_all(
+            &app_catalog,
+            None,
+            Some(&settings),
+            Some(&clipboard_history),
+            Some(&history),
+            "alpha",
+            8,
+        );
+        let clipboard_position = results
+            .iter()
+            .position(|result| result.source == SearchSource::Clipboard)
+            .expect("clipboard result should exist");
+        let history_position = results
+            .iter()
+            .position(|result| result.source == SearchSource::History)
+            .expect("history result should exist");
+
+        assert!(clipboard_position < history_position);
+
+        fs::remove_dir_all(settings_root).expect("temporary directory should be removed");
+        fs::remove_dir_all(history_root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn mixed_search_applies_final_limit_after_clipboard_merge() {
+        let app_catalog = AppCatalog::default();
+        let (settings_root, settings) = clipboard_settings(true);
+        let (history_root, clipboard_history) = clipboard_history(&[("alpha copied text", 1_700)]);
+        let history = history(&[("my alpha notes", 1_000, 1)]);
+
+        let results = search_all(
+            &app_catalog,
+            None,
+            Some(&settings),
+            Some(&clipboard_history),
+            Some(&history),
+            "alpha",
+            1,
+        );
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source, SearchSource::Clipboard);
+
+        fs::remove_dir_all(settings_root).expect("temporary directory should be removed");
+        fs::remove_dir_all(history_root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn mixed_search_falls_back_when_clipboard_state_is_absent() {
+        let app_catalog = AppCatalog::default();
+        let history = history(&[("alpha history", 1_700, 1)]);
+
+        let results = search_all(&app_catalog, None, None, None, Some(&history), "alpha", 8);
+
+        assert!(results
+            .iter()
+            .any(|result| result.source == SearchSource::History));
+        assert!(!results
+            .iter()
+            .any(|result| result.source == SearchSource::Clipboard));
+    }
+
+    #[test]
     fn mixed_search_keeps_strong_app_above_noisy_file_match() {
         let app_catalog = catalog(vec![app("report.desktop", "Report")]);
         let file_index = index(vec![file("/home/sanuk/Documents/Annual Report.pdf")]);
 
-        let results = search_all(&app_catalog, Some(&file_index), None, "report", 8);
+        let results = search_all(
+            &app_catalog,
+            Some(&file_index),
+            None,
+            None,
+            None,
+            "report",
+            8,
+        );
 
         assert_eq!(results[0].source, SearchSource::Applications);
         assert_eq!(results[0].title, "Report");
@@ -1333,7 +1577,15 @@ mod tests {
             folder("/home/sanuk/Documents/Reports"),
         ]);
 
-        let results = search_all(&app_catalog, Some(&file_index), None, "report", 1);
+        let results = search_all(
+            &app_catalog,
+            Some(&file_index),
+            None,
+            None,
+            None,
+            "report",
+            1,
+        );
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Reports");
@@ -1348,7 +1600,15 @@ mod tests {
         let second_file = file("/home/sanuk/Documents/Beta");
         let file_index = index(vec![second_file, first_file, folder]);
 
-        let results = search_all(&app_catalog, Some(&file_index), None, "alpha", 8);
+        let results = search_all(
+            &app_catalog,
+            Some(&file_index),
+            None,
+            None,
+            None,
+            "alpha",
+            8,
+        );
 
         assert_eq!(
             results
@@ -1374,7 +1634,7 @@ mod tests {
     fn mixed_search_falls_back_to_apps_without_file_index() {
         let app_catalog = catalog(vec![app("settings.desktop", "Settings")]);
 
-        let results = search_all(&app_catalog, None, None, "settings", 8);
+        let results = search_all(&app_catalog, None, None, None, None, "settings", 8);
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].source, SearchSource::Applications);
@@ -1385,7 +1645,7 @@ mod tests {
         let app_catalog = AppCatalog::default();
         let file_index = index(vec![file("/home/sanuk/Documents/2 plus 2 notes.txt")]);
 
-        let results = search_all(&app_catalog, Some(&file_index), None, "2+2", 8);
+        let results = search_all(&app_catalog, Some(&file_index), None, None, None, "2+2", 8);
 
         assert_eq!(results[0].source, SearchSource::Calculator);
         assert_eq!(results[0].title, "4");
@@ -1396,7 +1656,15 @@ mod tests {
         let app_catalog = catalog(vec![app("what-is-rust.desktop", "what is rust")]);
         let history = history(&[("what is rust", 1_700, 10)]);
 
-        let results = search_all(&app_catalog, None, Some(&history), "what is rust", 8);
+        let results = search_all(
+            &app_catalog,
+            None,
+            None,
+            None,
+            Some(&history),
+            "what is rust",
+            8,
+        );
 
         assert_eq!(results[0].source, SearchSource::Applications);
         assert_eq!(results[0].title, "what is rust");
@@ -1412,7 +1680,7 @@ mod tests {
     fn mixed_search_includes_settings_exact_match() {
         let app_catalog = AppCatalog::default();
 
-        let results = search_all(&app_catalog, None, None, "wifi", 8);
+        let results = search_all(&app_catalog, None, None, None, None, "wifi", 8);
 
         assert_eq!(results[0].source, SearchSource::Settings);
         assert_eq!(results[0].title, "Wi-Fi");
@@ -1422,7 +1690,15 @@ mod tests {
     fn mixed_search_includes_google_question_search() {
         let app_catalog = AppCatalog::default();
 
-        let results = search_all(&app_catalog, None, None, "what is rust tauri", 8);
+        let results = search_all(
+            &app_catalog,
+            None,
+            None,
+            None,
+            None,
+            "what is rust tauri",
+            8,
+        );
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].source, SearchSource::Web);
@@ -1434,7 +1710,7 @@ mod tests {
         let app_catalog = AppCatalog::default();
         let history = history(&[("wifi troubleshooting", 1_700, 20)]);
 
-        let results = search_all(&app_catalog, None, Some(&history), "wifi", 8);
+        let results = search_all(&app_catalog, None, None, None, Some(&history), "wifi", 8);
 
         assert_eq!(results[0].source, SearchSource::Settings);
         assert_eq!(results[0].title, "Wi-Fi");
@@ -1452,7 +1728,7 @@ mod tests {
         let app_catalog = catalog(vec![app("wifi.desktop", "WiFi Utility")]);
         let history = history(&[("wifi history", 1_700, 3)]);
 
-        let results = search_all(&app_catalog, None, Some(&history), "wifi", 2);
+        let results = search_all(&app_catalog, None, None, None, Some(&history), "wifi", 2);
 
         assert_eq!(results.len(), 2);
         assert_eq!(
@@ -1468,7 +1744,7 @@ mod tests {
     fn mixed_search_falls_back_when_history_is_absent() {
         let app_catalog = AppCatalog::default();
 
-        let results = search_all(&app_catalog, None, None, "wifi", 8);
+        let results = search_all(&app_catalog, None, None, None, None, "wifi", 8);
 
         assert!(results
             .iter()
