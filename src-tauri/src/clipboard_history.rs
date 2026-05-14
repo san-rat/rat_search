@@ -42,6 +42,7 @@ pub(crate) enum ClipboardRecordOutcome {
     IgnoredDuplicate,
     IgnoredTooLarge,
     IgnoredSensitive,
+    IgnoredDisabled,
 }
 
 impl ClipboardHistory {
