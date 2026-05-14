@@ -41,6 +41,7 @@ pub(crate) enum ClipboardRecordOutcome {
     IgnoredEmpty,
     IgnoredDuplicate,
     IgnoredTooLarge,
+    IgnoredSensitive,
 }
 
 impl ClipboardHistory {
@@ -147,6 +148,10 @@ impl ClipboardHistory {
             return ClipboardRecordOutcome::IgnoredTooLarge;
         }
 
+        if !should_store_clipboard_text(text, settings) {
+            return ClipboardRecordOutcome::IgnoredSensitive;
+        }
+
         if self
             .entries
             .first()
@@ -232,6 +237,77 @@ impl ClipboardHistory {
 
 pub(crate) fn normalize_clipboard_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+pub(crate) fn should_store_clipboard_text(text: &str, settings: &ClipboardSettings) -> bool {
+    let normalized_text = normalize_clipboard_text(text);
+
+    if normalized_text.is_empty() || text.len() > settings.max_text_bytes() as usize {
+        return false;
+    }
+
+    let lowercase_text = normalized_text.to_lowercase();
+
+    !looks_like_private_key(&lowercase_text) && !looks_like_secret_label(&lowercase_text)
+}
+
+fn looks_like_private_key(value: &str) -> bool {
+    value.contains("begin private key")
+        || value.contains("begin rsa private key")
+        || value.contains("begin openssh private key")
+}
+
+fn looks_like_secret_label(value: &str) -> bool {
+    const SECRET_TERMS: [&str; 8] = [
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "api_key",
+        "apikey",
+        "access_key",
+        "private key",
+    ];
+
+    SECRET_TERMS
+        .iter()
+        .any(|term| has_secret_label(value, term))
+}
+
+fn has_secret_label(value: &str, term: &str) -> bool {
+    let mut search_start = 0;
+
+    while let Some(relative_index) = value[search_start..].find(term) {
+        let term_start = search_start + relative_index;
+        let term_end = term_start + term.len();
+
+        if has_label_boundary(value, term_start, term_end) && has_label_value(value, term_end) {
+            return true;
+        }
+
+        search_start = term_end;
+    }
+
+    false
+}
+
+fn has_label_boundary(value: &str, term_start: usize, term_end: usize) -> bool {
+    let before = value[..term_start].chars().next_back();
+    let after = value[term_end..].chars().next();
+
+    !before.is_some_and(is_label_char) && !after.is_some_and(is_label_char)
+}
+
+fn has_label_value(value: &str, term_end: usize) -> bool {
+    let mut chars = value[term_end..].chars().skip_while(|character| {
+        character.is_whitespace() || matches!(character, ':' | '=' | '-' | '_')
+    });
+
+    chars.next().is_some()
+}
+
+fn is_label_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_'
 }
 
 fn preview_for_text(normalized_text: &str) -> String {
@@ -353,6 +429,79 @@ mod tests {
             use_count: 0,
             text_len: text.chars().count(),
         }
+    }
+
+    fn assert_rejected_without_secret_output(sample: &str, settings: &ClipboardSettings) {
+        assert!(!should_store_clipboard_text(sample, settings));
+    }
+
+    #[test]
+    fn normal_short_text_is_accepted_by_sensitive_filter() {
+        let settings = settings(100, 10_000, 7);
+
+        assert!(should_store_clipboard_text(
+            "meeting notes for tomorrow",
+            &settings
+        ));
+    }
+
+    #[test]
+    fn empty_text_is_rejected_by_sensitive_filter() {
+        let settings = settings(100, 10_000, 7);
+
+        assert!(!should_store_clipboard_text(" \n\t ", &settings));
+    }
+
+    #[test]
+    fn over_limit_text_is_rejected_by_sensitive_filter() {
+        let settings = settings(100, 3, 7);
+
+        assert!(!should_store_clipboard_text("four", &settings));
+    }
+
+    #[test]
+    fn private_key_blocks_are_rejected() {
+        let settings = settings(100, 10_000, 7);
+
+        assert_rejected_without_secret_output("-----BEGIN PRIVATE KEY----- abc", &settings);
+        assert_rejected_without_secret_output("-----BEGIN RSA PRIVATE KEY----- abc", &settings);
+        assert_rejected_without_secret_output("-----BEGIN OPENSSH PRIVATE KEY----- abc", &settings);
+    }
+
+    #[test]
+    fn password_labelled_text_is_rejected() {
+        let settings = settings(100, 10_000, 7);
+
+        assert_rejected_without_secret_output("password=example", &settings);
+        assert_rejected_without_secret_output("passwd: example", &settings);
+    }
+
+    #[test]
+    fn token_labelled_text_is_rejected() {
+        let settings = settings(100, 10_000, 7);
+
+        assert_rejected_without_secret_output("token: example", &settings);
+        assert_rejected_without_secret_output("secret = example", &settings);
+    }
+
+    #[test]
+    fn api_key_and_access_key_labels_are_rejected() {
+        let settings = settings(100, 10_000, 7);
+
+        assert_rejected_without_secret_output("api_key=example", &settings);
+        assert_rejected_without_secret_output("apikey: example", &settings);
+        assert_rejected_without_secret_output("access_key example", &settings);
+    }
+
+    #[test]
+    fn record_text_ignores_sensitive_content() {
+        let mut history = history_with(Vec::new());
+        let settings = settings(100, 10_000, 7);
+
+        let outcome = history.record_text_at("password=example", 1_700, &settings);
+
+        assert!(matches!(outcome, ClipboardRecordOutcome::IgnoredSensitive));
+        assert!(history.entries().is_empty());
     }
 
     #[test]
