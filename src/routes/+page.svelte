@@ -518,6 +518,10 @@
       return "Could not complete action";
     }
 
+    if (action === "copy_clipboard_text" || action === "delete_clipboard_item") {
+      return "Could not complete action";
+    }
+
     return "Could not open item";
   }
 
@@ -527,9 +531,25 @@
   }
 
   function recordSearchHistory(queryBeforeAction: string) {
+    if (!queryBeforeAction.trim()) {
+      return;
+    }
+
     void invoke("record_search_history", { query: queryBeforeAction }).catch((error) => {
       console.error("failed to record search history", error);
     });
+  }
+
+  function removeResultById(resultId: string) {
+    const nextResults = results.filter((result) => result.id !== resultId);
+    results = nextResults;
+
+    if (nextResults.length === 0) {
+      selectedIndex = -1;
+      return;
+    }
+
+    selectedIndex = Math.min(selectedIndex, nextResults.length - 1);
   }
 
   async function runSelectedResultAction(actionOverride?: ShortcutAction) {
@@ -600,6 +620,34 @@
 
           await invoke("open_setting", { settingId: metadata.setting_id });
           break;
+        }
+
+        case "copy_clipboard_text": {
+          const metadata = clipboardMetadata(selected);
+
+          if (!metadata) {
+            failSelectedAction(action);
+            return;
+          }
+
+          await invoke("copy_clipboard_item", { itemId: metadata.item_id });
+          break;
+        }
+
+        case "delete_clipboard_item": {
+          const metadata = clipboardMetadata(selected);
+
+          if (!metadata) {
+            failSelectedAction(action);
+            return;
+          }
+
+          await invoke("delete_clipboard_item", { itemId: metadata.item_id });
+          removeResultById(selected.id);
+          searchError = null;
+          actionError = null;
+          focusSearchInput();
+          return;
         }
 
         case "reuse_query": {
