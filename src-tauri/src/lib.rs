@@ -33,7 +33,7 @@ use clipboard_settings::ClipboardSettings;
 use file_actions::{PreferredOpen, ValidatedPath};
 use file_index::FileIndex;
 use search_history::SearchHistory;
-use search_result::{SearchResult, SearchSource};
+use search_result::{SearchAction, SearchResult, SearchSource};
 use settings_search::PreparedSettingCommand;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
@@ -879,6 +879,19 @@ fn search_all(
     limit: usize,
 ) -> Vec<SearchResult> {
     let limit = settings::normalize_result_limit(limit);
+    if let Some(open_query) = open_intent_query(query) {
+        return file_index
+            .map(|file_index| {
+                file_search::search_files_with_action(
+                    file_index,
+                    open_query,
+                    limit,
+                    SearchAction::OpenInCode,
+                )
+            })
+            .unwrap_or_default();
+    }
+
     let mut results = app_search::search_apps(catalog, query, limit);
 
     if let Some(file_index) = file_index {
@@ -906,6 +919,17 @@ fn search_all(
     results.sort_by(compare_search_results);
     results.truncate(limit);
     results
+}
+
+fn open_intent_query(query: &str) -> Option<&str> {
+    let trimmed = query.trim_start();
+    let (first, rest) = trimmed
+        .split_once(char::is_whitespace)
+        .unwrap_or((trimmed, ""));
+
+    first
+        .eq_ignore_ascii_case("open")
+        .then_some(rest.trim_start())
 }
 
 fn compare_search_results(left: &SearchResult, right: &SearchResult) -> std::cmp::Ordering {
@@ -1117,7 +1141,7 @@ mod tests {
         app_discovery::{AppCatalog, AppRecord},
         file_index::{FileIndex, FileRecord},
         search_history::SearchHistory,
-        search_result::SearchSource,
+        search_result::{SearchAction, SearchSource},
     };
 
     use super::*;
@@ -1952,6 +1976,82 @@ mod tests {
         assert_eq!(results[0].source, SearchSource::Applications);
         assert_eq!(results[0].title, "Report");
         assert_eq!(results[1].source, SearchSource::Files);
+    }
+
+    #[test]
+    fn open_intent_strips_prefix_and_returns_file_suggestions() {
+        let app_catalog = catalog(vec![app("code.desktop", "Code")]);
+        let file_index = index(vec![
+            file("/home/sanuk/Documents/work_done.md"),
+            file("/home/sanuk/Documents/notes.txt"),
+        ]);
+
+        let results = search_all(
+            &app_catalog,
+            Some(&file_index),
+            None,
+            None,
+            None,
+            "open work_done.md",
+            8,
+        );
+
+        assert_eq!(results.first().expect("file result").title, "work_done.md");
+        assert!(results
+            .iter()
+            .all(|result| result.action == SearchAction::OpenInCode));
+        assert!(results
+            .iter()
+            .all(|result| result.source == SearchSource::Files));
+    }
+
+    #[test]
+    fn open_intent_is_case_insensitive_and_returns_folder_suggestions() {
+        let app_catalog = catalog(Vec::new());
+        let file_index = index(vec![
+            folder("/home/sanuk/Desktop/Projects/pc_work"),
+            folder("/home/sanuk/Desktop/Projects/other"),
+        ]);
+
+        let results = search_all(
+            &app_catalog,
+            Some(&file_index),
+            None,
+            None,
+            None,
+            "OPEN pc_work",
+            8,
+        );
+
+        let result = results.first().expect("folder result");
+        assert_eq!(result.title, "pc_work");
+        assert_eq!(result.action, SearchAction::OpenInCode);
+        assert_eq!(result.source, SearchSource::Folders);
+        assert!(matches!(
+            result.metadata,
+            Some(search_result::SearchMetadata::Folder)
+        ));
+    }
+
+    #[test]
+    fn normal_file_search_keeps_default_open_action() {
+        let app_catalog = catalog(Vec::new());
+        let file_index = index(vec![file("/home/sanuk/Documents/work_done.md")]);
+
+        let results = search_all(
+            &app_catalog,
+            Some(&file_index),
+            None,
+            None,
+            None,
+            "work_done.md",
+            8,
+        );
+
+        assert_eq!(
+            results.first().expect("file result").action,
+            SearchAction::OpenPath
+        );
     }
 
     #[test]

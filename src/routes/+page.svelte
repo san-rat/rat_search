@@ -25,7 +25,7 @@
     | "copy_clipboard_text"
     | "delete_clipboard_item"
     | "reuse_query";
-  type PathAction = "open_path" | "reveal_path" | "copy_path";
+  type PathAction = "open_path" | "open_in_code" | "reveal_path" | "copy_path";
   type ShortcutAction = Extract<SearchAction, "reveal_path" | "copy_path">;
 
   type ApplicationMetadata = {
@@ -542,7 +542,12 @@
   }
 
   function isPathAction(action: SearchAction): action is PathAction {
-    return action === "open_path" || action === "reveal_path" || action === "copy_path";
+    return (
+      action === "open_path" ||
+      action === "open_in_code" ||
+      action === "reveal_path" ||
+      action === "copy_path"
+    );
   }
 
   function selectedResultCanRunShortcut(action: ShortcutAction) {
@@ -653,6 +658,7 @@
           break;
 
         case "open_path":
+        case "open_in_code":
         case "reveal_path":
         case "copy_path":
           if (!selected.path || !isFileSystemResult(selected)) {

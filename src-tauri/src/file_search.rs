@@ -19,6 +19,15 @@ const RECENT_SEVEN_DAY_BOOST: i32 = 12;
 const RECENT_THIRTY_DAY_BOOST: i32 = 6;
 
 pub(crate) fn search_files(index: &FileIndex, query: &str, limit: usize) -> Vec<SearchResult> {
+    search_files_with_action(index, query, limit, SearchAction::OpenPath)
+}
+
+pub(crate) fn search_files_with_action(
+    index: &FileIndex,
+    query: &str,
+    limit: usize,
+    action: SearchAction,
+) -> Vec<SearchResult> {
     let query = normalize(query);
     let limit = settings::normalize_result_limit(limit);
 
@@ -45,7 +54,7 @@ pub(crate) fn search_files(index: &FileIndex, query: &str, limit: usize) -> Vec<
     matches
         .into_iter()
         .take(limit)
-        .map(|(record, score)| search_result_from_record(record, score))
+        .map(|(record, score)| search_result_from_record(record, score, action.clone()))
         .collect()
 }
 
@@ -166,7 +175,11 @@ fn normalize(value: &str) -> String {
         .to_lowercase()
 }
 
-fn search_result_from_record(record: &FileRecord, score: i32) -> SearchResult {
+fn search_result_from_record(
+    record: &FileRecord,
+    score: i32,
+    action: SearchAction,
+) -> SearchResult {
     let source = if record.is_dir {
         SearchSource::Folders
     } else {
@@ -187,7 +200,7 @@ fn search_result_from_record(record: &FileRecord, score: i32) -> SearchResult {
         subtitle: Some(record.parent_path.to_string_lossy().into_owned()),
         icon: Some(file_icons::icon_for_record(record).to_owned()),
         source,
-        action: SearchAction::OpenPath,
+        action,
         path: Some(record.path.to_string_lossy().into_owned()),
         score,
         metadata: Some(metadata),
@@ -373,6 +386,28 @@ mod tests {
                 modified_time_ms: None
             })
         );
+    }
+
+    #[test]
+    fn custom_file_action_is_applied_without_changing_metadata() {
+        let results = search_files_with_action(
+            &index(vec![
+                file("/home/sanuk/Documents/work_done.md"),
+                folder("/home/sanuk/Documents/rat_search"),
+            ]),
+            "work",
+            8,
+            SearchAction::OpenInCode,
+        );
+
+        let result = results.first().expect("file result should exist");
+
+        assert_eq!(result.action, SearchAction::OpenInCode);
+        assert_eq!(
+            result.path.as_deref(),
+            Some("/home/sanuk/Documents/work_done.md")
+        );
+        assert!(matches!(result.metadata, Some(SearchMetadata::File { .. })));
     }
 
     #[test]
