@@ -600,6 +600,10 @@
       return "Could not complete action";
     }
 
+    if (action === "open_calculator_app") {
+      return "Could not open calculator";
+    }
+
     if (action === "copy_clipboard_text" || action === "delete_clipboard_item") {
       return "Could not complete action";
     }
@@ -678,6 +682,22 @@
           }
 
           await invoke("copy_text", { text: metadata.copy_text });
+          break;
+        }
+
+        case "open_calculator_app": {
+          const metadata = calculatorMetadata(selected);
+
+          if (!metadata) {
+            failSelectedAction(action);
+            return;
+          }
+
+          await invoke("open_calculator_app", {
+            expression: metadata.expression,
+            result: metadata.result,
+            copyText: metadata.copy_text,
+          });
           break;
         }
 

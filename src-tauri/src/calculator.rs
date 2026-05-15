@@ -42,7 +42,7 @@ pub(crate) fn search_calculator(query: &str, limit: usize) -> Vec<SearchResult> 
         subtitle: Some(expression.to_owned()),
         icon: Some("calculator".to_owned()),
         source: SearchSource::Calculator,
-        action: SearchAction::CopyText,
+        action: SearchAction::OpenCalculatorApp,
         path: None,
         score: CALCULATOR_SCORE,
         metadata: Some(SearchMetadata::Calculator {
@@ -422,7 +422,7 @@ mod tests {
                 "subtitle": "2 + 2",
                 "icon": "calculator",
                 "source": "calculator",
-                "action": "copy_text",
+                "action": "open_calculator_app",
                 "path": null,
                 "score": 980,
                 "metadata": {
