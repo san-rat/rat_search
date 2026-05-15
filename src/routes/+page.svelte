@@ -600,6 +600,10 @@
       return "Could not complete action";
     }
 
+    if (action === "open_in_code") {
+      return "Could not open item";
+    }
+
     if (action === "open_calculator_app") {
       return "Could not open calculator";
     }
