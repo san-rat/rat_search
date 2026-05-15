@@ -30,7 +30,7 @@ use app_discovery::AppCatalog;
 use app_launch::LaunchResult;
 use clipboard_history::{ClipboardHistory, ClipboardRecordOutcome};
 use clipboard_settings::ClipboardSettings;
-use file_actions::ValidatedPath;
+use file_actions::{PreferredOpen, ValidatedPath};
 use file_index::FileIndex;
 use search_history::SearchHistory;
 use search_result::{SearchResult, SearchSource};
@@ -307,6 +307,21 @@ fn validate_file_action_path(
 
 fn path_for_opener(path: &std::path::Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+fn spawn_prepared_command(command: &file_actions::PreparedCommand) -> Result<(), String> {
+    Command::new(&command.program)
+        .args(&command.args)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| {
+            eprintln!(
+                "failed to spawn '{} {}': {error}",
+                command.program,
+                command.args.join(" ")
+            );
+            "Could not open item".to_owned()
+        })
 }
 
 fn validate_copy_text(text: &str) -> Result<&str, String> {
@@ -659,6 +674,37 @@ fn open_path(
 }
 
 #[tauri::command]
+fn open_in_code(
+    app: tauri::AppHandle,
+    file_index: tauri::State<'_, FileIndexState>,
+    path: String,
+) -> Result<(), String> {
+    let validated_path = validate_file_action_path(&file_index, &path)?;
+    let preferred_open = file_actions::prepare_open_in_code(&validated_path);
+
+    match preferred_open {
+        PreferredOpen::Code(command) => {
+            if spawn_prepared_command(&command).is_ok() {
+                return hide_launcher_for_app(&app);
+            }
+        }
+        PreferredOpen::System => {}
+    }
+
+    app.opener()
+        .open_path(path_for_opener(&validated_path.path), None::<&str>)
+        .map_err(|error| {
+            eprintln!(
+                "failed to open fallback path '{}': {error}",
+                validated_path.path.display()
+            );
+            "Could not open item".to_owned()
+        })?;
+
+    hide_launcher_for_app(&app)
+}
+
+#[tauri::command]
 fn reveal_path(
     app: tauri::AppHandle,
     file_index: tauri::State<'_, FileIndexState>,
@@ -995,6 +1041,7 @@ pub fn run() {
             get_clipboard_privacy_status,
             hide_launcher,
             launch_app,
+            open_in_code,
             open_path,
             open_setting,
             open_url,
