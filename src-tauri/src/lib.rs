@@ -6,6 +6,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use serde::Serialize;
 use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Size, WebviewWindow};
 
 mod app_discovery;
@@ -13,6 +14,8 @@ mod app_icons;
 mod app_launch;
 mod app_search;
 mod calculator;
+mod clipboard_history;
+mod clipboard_settings;
 mod file_actions;
 mod file_icons;
 mod file_index;
@@ -25,6 +28,8 @@ mod web_shortcuts;
 
 use app_discovery::AppCatalog;
 use app_launch::LaunchResult;
+use clipboard_history::{ClipboardHistory, ClipboardRecordOutcome};
+use clipboard_settings::ClipboardSettings;
 use file_actions::ValidatedPath;
 use file_index::FileIndex;
 use search_history::SearchHistory;
@@ -34,11 +39,25 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
 
 type FileIndexState = Arc<RwLock<FileIndex>>;
+type ClipboardHistoryState = Arc<RwLock<ClipboardHistory>>;
+type ClipboardSettingsState = Arc<RwLock<ClipboardSettings>>;
 type SearchHistoryState = Arc<RwLock<SearchHistory>>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ClipboardPrivacyStatus {
+    enabled: bool,
+    entry_count: usize,
+    retention_days: u32,
+    max_entries: u32,
+    max_text_bytes: u32,
+}
 
 const LAUNCHER_WINDOW_LABEL: &str = "main";
 const LAUNCHER_SHOWN_EVENT: &str = "launcher:shown";
 const TOGGLE_ARG: &str = "toggle";
+const CLIPBOARD_HISTORY_FILE_NAME: &str = "clipboard-history.json";
+const CLIPBOARD_SETTINGS_FILE_NAME: &str = "clipboard-settings.json";
+const CLIPBOARD_POLL_INTERVAL_MS: u64 = 1_000;
 const SEARCH_HISTORY_FILE_NAME: &str = "search-history.json";
 const DELAYED_CENTER_MS: u64 = 80;
 const LAUNCHER_VERTICAL_PERCENT: u32 = 25;
@@ -302,6 +321,14 @@ fn history_file_path_from_data_dir(data_dir: &Path) -> PathBuf {
     data_dir.join(SEARCH_HISTORY_FILE_NAME)
 }
 
+fn clipboard_history_file_path_from_data_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(CLIPBOARD_HISTORY_FILE_NAME)
+}
+
+fn clipboard_settings_file_path_from_data_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(CLIPBOARD_SETTINGS_FILE_NAME)
+}
+
 fn search_history_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_data_dir()
@@ -309,10 +336,36 @@ fn search_history_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| error.to_string())
 }
 
+fn clipboard_history_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|data_dir| clipboard_history_file_path_from_data_dir(&data_dir))
+        .map_err(|error| error.to_string())
+}
+
+fn clipboard_settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|data_dir| clipboard_settings_file_path_from_data_dir(&data_dir))
+        .map_err(|error| error.to_string())
+}
+
 fn fallback_search_history_path() -> PathBuf {
     std::env::temp_dir()
         .join("rat-search")
         .join(SEARCH_HISTORY_FILE_NAME)
+}
+
+fn fallback_clipboard_history_path() -> PathBuf {
+    std::env::temp_dir()
+        .join("rat-search")
+        .join(CLIPBOARD_HISTORY_FILE_NAME)
+}
+
+fn fallback_clipboard_settings_path() -> PathBuf {
+    std::env::temp_dir()
+        .join("rat-search")
+        .join(CLIPBOARD_SETTINGS_FILE_NAME)
 }
 
 fn load_search_history_state(app: &tauri::AppHandle) -> SearchHistoryState {
@@ -326,6 +379,217 @@ fn load_search_history_state(app: &tauri::AppHandle) -> SearchHistoryState {
     dev_log(format!("loaded {entry_count} search history entries"));
 
     Arc::new(RwLock::new(history))
+}
+
+fn load_clipboard_states(
+    app: &tauri::AppHandle,
+) -> (ClipboardSettingsState, ClipboardHistoryState) {
+    let settings_path = clipboard_settings_path(app).unwrap_or_else(|error| {
+        eprintln!("failed to resolve clipboard settings path: {error}");
+        fallback_clipboard_settings_path()
+    });
+    let history_path = clipboard_history_path(app).unwrap_or_else(|error| {
+        eprintln!("failed to resolve clipboard history path: {error}");
+        fallback_clipboard_history_path()
+    });
+
+    load_clipboard_states_from_paths(settings_path, history_path, current_time_ms())
+}
+
+fn load_clipboard_states_from_paths(
+    settings_path: PathBuf,
+    history_path: PathBuf,
+    now_ms: u64,
+) -> (ClipboardSettingsState, ClipboardHistoryState) {
+    let settings = ClipboardSettings::load(settings_path);
+    let mut history = ClipboardHistory::load(history_path);
+    let before_prune_count = history.entries().len();
+
+    history.prune_expired_at(now_ms, settings.retention_days());
+
+    if history.entries().len() != before_prune_count {
+        if let Err(error) = history.save() {
+            eprintln!("failed to save pruned clipboard history: {error}");
+        }
+    }
+
+    let entry_count = history.entries().len();
+    let status = if settings.is_enabled() {
+        "enabled"
+    } else {
+        "disabled"
+    };
+
+    dev_log(format!(
+        "loaded {entry_count} clipboard history entries; clipboard history is {status}"
+    ));
+
+    (
+        Arc::new(RwLock::new(settings)),
+        Arc::new(RwLock::new(history)),
+    )
+}
+
+fn start_clipboard_monitor(
+    app: tauri::AppHandle,
+    settings: ClipboardSettingsState,
+    history: ClipboardHistoryState,
+) {
+    thread::spawn(move || loop {
+        let enabled = match settings.read() {
+            Ok(settings) => settings.is_enabled(),
+            Err(error) => {
+                eprintln!("failed to read clipboard settings for monitor: {error}");
+                false
+            }
+        };
+
+        if enabled {
+            match app.clipboard().read_text() {
+                Ok(text) => {
+                    if let Err(error) = record_clipboard_text_in_state(
+                        &settings,
+                        &history,
+                        &text,
+                        current_time_ms(),
+                    ) {
+                        eprintln!("failed to record clipboard text: {error}");
+                    }
+                }
+                Err(error) => {
+                    eprintln!("failed to read clipboard text: {error}");
+                }
+            }
+        }
+
+        thread::sleep(Duration::from_millis(CLIPBOARD_POLL_INTERVAL_MS));
+    });
+}
+
+fn record_clipboard_text_in_state(
+    settings: &ClipboardSettingsState,
+    history: &ClipboardHistoryState,
+    text: &str,
+    now_ms: u64,
+) -> Result<ClipboardRecordOutcome, String> {
+    let settings = settings
+        .read()
+        .map_err(|_| "Clipboard settings unavailable".to_owned())?;
+
+    if !settings.is_enabled() {
+        return Ok(ClipboardRecordOutcome::IgnoredDisabled);
+    }
+
+    let mut history = history
+        .write()
+        .map_err(|_| "Clipboard history unavailable".to_owned())?;
+    let outcome = history.record_text_at(text, now_ms, &settings);
+
+    if matches!(
+        outcome,
+        ClipboardRecordOutcome::Recorded | ClipboardRecordOutcome::UpdatedExisting
+    ) {
+        history
+            .save()
+            .map_err(|_| "Could not save clipboard history".to_owned())?;
+    }
+
+    Ok(outcome)
+}
+
+fn set_clipboard_history_enabled_in_state(
+    settings: &ClipboardSettingsState,
+    enabled: bool,
+    now_ms: u64,
+) -> Result<(), String> {
+    let mut settings = settings
+        .write()
+        .map_err(|_| "Clipboard settings unavailable".to_owned())?;
+
+    settings.set_enabled(enabled, now_ms);
+    settings
+        .save()
+        .map_err(|_| "Could not save clipboard settings".to_owned())
+}
+
+fn clear_clipboard_history_in_state(history: &ClipboardHistoryState) -> Result<(), String> {
+    let mut history = history
+        .write()
+        .map_err(|_| "Clipboard history unavailable".to_owned())?;
+
+    history.clear();
+    history
+        .save()
+        .map_err(|_| "Could not save clipboard history".to_owned())
+}
+
+fn delete_clipboard_item_in_state(
+    history: &ClipboardHistoryState,
+    item_id: &str,
+) -> Result<(), String> {
+    let mut history = history
+        .write()
+        .map_err(|_| "Clipboard history unavailable".to_owned())?;
+
+    if !history.delete_item(item_id) {
+        return Err("Could not complete action".to_owned());
+    }
+
+    history
+        .save()
+        .map_err(|_| "Could not save clipboard history".to_owned())
+}
+
+fn clipboard_item_text_from_state(
+    history: &ClipboardHistoryState,
+    item_id: &str,
+) -> Result<String, String> {
+    let history = history
+        .read()
+        .map_err(|_| "Clipboard history unavailable".to_owned())?;
+
+    history
+        .item_text(item_id)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| "Could not complete action".to_owned())
+}
+
+fn mark_clipboard_item_copied_in_state(
+    history: &ClipboardHistoryState,
+    item_id: &str,
+    now_ms: u64,
+) -> Result<(), String> {
+    let mut history = history
+        .write()
+        .map_err(|_| "Clipboard history unavailable".to_owned())?;
+
+    if !history.mark_item_used_at(item_id, now_ms) {
+        return Err("Could not complete action".to_owned());
+    }
+
+    history
+        .save()
+        .map_err(|_| "Could not save clipboard history".to_owned())
+}
+
+fn clipboard_privacy_status_from_state(
+    settings: &ClipboardSettingsState,
+    history: &ClipboardHistoryState,
+) -> Result<ClipboardPrivacyStatus, String> {
+    let settings = settings
+        .read()
+        .map_err(|_| "Clipboard settings unavailable".to_owned())?;
+    let history = history
+        .read()
+        .map_err(|_| "Clipboard history unavailable".to_owned())?;
+
+    Ok(ClipboardPrivacyStatus {
+        enabled: settings.is_enabled(),
+        entry_count: history.entries().len(),
+        retention_days: settings.retention_days(),
+        max_entries: settings.max_entries(),
+        max_text_bytes: settings.max_text_bytes(),
+    })
 }
 
 fn current_time_ms() -> u64 {
@@ -452,6 +716,58 @@ fn copy_text(app: tauri::AppHandle, text: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn enable_clipboard_history(
+    settings: tauri::State<'_, ClipboardSettingsState>,
+) -> Result<(), String> {
+    set_clipboard_history_enabled_in_state(&settings, true, current_time_ms())
+}
+
+#[tauri::command]
+fn disable_clipboard_history(
+    settings: tauri::State<'_, ClipboardSettingsState>,
+) -> Result<(), String> {
+    set_clipboard_history_enabled_in_state(&settings, false, current_time_ms())
+}
+
+#[tauri::command]
+fn clear_clipboard_history(history: tauri::State<'_, ClipboardHistoryState>) -> Result<(), String> {
+    clear_clipboard_history_in_state(&history)
+}
+
+#[tauri::command]
+fn delete_clipboard_item(
+    history: tauri::State<'_, ClipboardHistoryState>,
+    item_id: String,
+) -> Result<(), String> {
+    delete_clipboard_item_in_state(&history, &item_id)
+}
+
+#[tauri::command]
+fn copy_clipboard_item(
+    app: tauri::AppHandle,
+    history: tauri::State<'_, ClipboardHistoryState>,
+    item_id: String,
+) -> Result<(), String> {
+    let text = clipboard_item_text_from_state(&history, &item_id)?;
+
+    app.clipboard().write_text(text).map_err(|error| {
+        eprintln!("failed to copy clipboard history item: {error}");
+        "Could not complete action".to_owned()
+    })?;
+
+    mark_clipboard_item_copied_in_state(&history, &item_id, current_time_ms())?;
+    hide_launcher_for_app(&app)
+}
+
+#[tauri::command]
+fn get_clipboard_privacy_status(
+    settings: tauri::State<'_, ClipboardSettingsState>,
+    history: tauri::State<'_, ClipboardHistoryState>,
+) -> Result<ClipboardPrivacyStatus, String> {
+    clipboard_privacy_status_from_state(&settings, &history)
+}
+
+#[tauri::command]
 fn open_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
     if !web_shortcuts::is_allowed_url(&url) {
         return Err("Could not open item".to_owned());
@@ -510,6 +826,8 @@ fn start_file_index_scan(file_index: FileIndexState) {
 fn search_all(
     catalog: &AppCatalog,
     file_index: Option<&FileIndex>,
+    clipboard_settings: Option<&ClipboardSettings>,
+    clipboard_history: Option<&ClipboardHistory>,
     history: Option<&SearchHistory>,
     query: &str,
     limit: usize,
@@ -524,6 +842,16 @@ fn search_all(
     results.extend(calculator::search_calculator(query, limit));
     results.extend(web_shortcuts::search_web_shortcuts(query, limit));
     results.extend(settings_search::search_settings(query, limit));
+
+    if clipboard_settings.is_some_and(ClipboardSettings::is_enabled) {
+        if let Some(clipboard_history) = clipboard_history {
+            results.extend(clipboard_history::search_clipboard(
+                clipboard_history,
+                query,
+                limit,
+            ));
+        }
+    }
 
     if let Some(history) = history {
         results.extend(search_history::search_history(history, query, limit));
@@ -551,7 +879,8 @@ fn source_priority(source: &SearchSource) -> u8 {
         SearchSource::Folders => 3,
         SearchSource::Files => 4,
         SearchSource::Web => 5,
-        SearchSource::History => 6,
+        SearchSource::Clipboard => 6,
+        SearchSource::History => 7,
     }
 }
 
@@ -567,6 +896,8 @@ fn normalize_search_text(value: &str) -> String {
 fn search(
     catalog: tauri::State<'_, AppCatalog>,
     file_index: tauri::State<'_, FileIndexState>,
+    clipboard_settings: tauri::State<'_, ClipboardSettingsState>,
+    clipboard_history: tauri::State<'_, ClipboardHistoryState>,
     history: tauri::State<'_, SearchHistoryState>,
     query: String,
     limit: usize,
@@ -575,6 +906,20 @@ fn search(
         Ok(index) => Some(index),
         Err(error) => {
             eprintln!("failed to read file index for search: {error}");
+            None
+        }
+    };
+    let clipboard_settings_guard = match clipboard_settings.read() {
+        Ok(settings) => Some(settings),
+        Err(error) => {
+            eprintln!("failed to read clipboard settings for search: {error}");
+            None
+        }
+    };
+    let clipboard_history_guard = match clipboard_history.read() {
+        Ok(history) => Some(history),
+        Err(error) => {
+            eprintln!("failed to read clipboard history for search: {error}");
             None
         }
     };
@@ -589,6 +934,8 @@ fn search(
     search_all(
         &catalog,
         file_index_guard.as_deref(),
+        clipboard_settings_guard.as_deref(),
+        clipboard_history_guard.as_deref(),
         history_guard.as_deref(),
         &query,
         limit,
@@ -638,8 +985,14 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             close_launcher,
+            clear_clipboard_history,
+            copy_clipboard_item,
             copy_path,
             copy_text,
+            delete_clipboard_item,
+            disable_clipboard_history,
+            enable_clipboard_history,
+            get_clipboard_privacy_status,
             hide_launcher,
             launch_app,
             open_path,
@@ -670,6 +1023,18 @@ pub fn run() {
             let search_history = load_search_history_state(app.handle());
             app.manage(search_history);
 
+            let (clipboard_settings, clipboard_history) = load_clipboard_states(app.handle());
+            app.manage(clipboard_settings);
+            app.manage(clipboard_history);
+
+            let clipboard_settings = app.state::<ClipboardSettingsState>().inner().clone();
+            let clipboard_history = app.state::<ClipboardHistoryState>().inner().clone();
+            start_clipboard_monitor(
+                app.handle().clone(),
+                clipboard_settings,
+                clipboard_history,
+            );
+
             let file_index = Arc::new(RwLock::new(FileIndex::new()));
             app.manage(file_index.clone());
             start_file_index_scan(file_index);
@@ -698,6 +1063,8 @@ mod tests {
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    use serde_json::json;
 
     use crate::{
         app_discovery::{AppCatalog, AppRecord},
@@ -751,6 +1118,45 @@ mod tests {
         history
     }
 
+    fn clipboard_settings(enabled: bool) -> (PathBuf, ClipboardSettings) {
+        let root = temporary_directory(if enabled {
+            "enabled-clipboard-settings"
+        } else {
+            "disabled-clipboard-settings"
+        });
+        let path = root.join("clipboard-settings.json");
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "enabled": enabled,
+                "max_entries": 100,
+                "max_text_bytes": 10000,
+                "retention_days": 7,
+                "updated_at_ms": 1_700
+            }))
+            .expect("settings should serialize"),
+        )
+        .expect("clipboard settings should be written");
+
+        (root, ClipboardSettings::load(path))
+    }
+
+    fn clipboard_history(entries: &[(&str, u64)]) -> (PathBuf, ClipboardHistory) {
+        let root = temporary_directory("clipboard-history");
+        let path = root.join("clipboard-history.json");
+        let (settings_root, settings) = clipboard_settings(true);
+        let mut history = ClipboardHistory::load(path);
+
+        for (text, copied_at_ms) in entries {
+            history.record_text_at(text, *copied_at_ms, &settings);
+        }
+
+        fs::remove_dir_all(settings_root).expect("temporary directory should be removed");
+
+        (root, history)
+    }
+
     fn temporary_directory(name: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -768,12 +1174,473 @@ mod tests {
         Arc::new(RwLock::new(SearchHistory::load(path)))
     }
 
+    fn clipboard_settings_state(path: PathBuf, enabled: bool) -> ClipboardSettingsState {
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "enabled": enabled,
+                "max_entries": 100,
+                "max_text_bytes": 10000,
+                "retention_days": 7,
+                "updated_at_ms": 1_700
+            }))
+            .expect("settings should serialize"),
+        )
+        .expect("clipboard settings should be written");
+
+        Arc::new(RwLock::new(ClipboardSettings::load(path)))
+    }
+
+    fn clipboard_history_state(path: PathBuf) -> ClipboardHistoryState {
+        Arc::new(RwLock::new(ClipboardHistory::load(path)))
+    }
+
     #[test]
     fn history_file_path_from_data_dir_appends_history_file_name() {
         assert_eq!(
             history_file_path_from_data_dir(Path::new("/tmp/rat-search-data")),
             PathBuf::from("/tmp/rat-search-data").join(SEARCH_HISTORY_FILE_NAME)
         );
+    }
+
+    #[test]
+    fn clipboard_path_helpers_append_expected_file_names() {
+        let data_dir = Path::new("/tmp/rat-search-data");
+
+        assert_eq!(
+            clipboard_history_file_path_from_data_dir(data_dir),
+            PathBuf::from("/tmp/rat-search-data").join(CLIPBOARD_HISTORY_FILE_NAME)
+        );
+        assert_eq!(
+            clipboard_settings_file_path_from_data_dir(data_dir),
+            PathBuf::from("/tmp/rat-search-data").join(CLIPBOARD_SETTINGS_FILE_NAME)
+        );
+    }
+
+    #[test]
+    fn clipboard_fallback_paths_use_temp_rat_search_directory() {
+        assert_eq!(
+            fallback_clipboard_history_path(),
+            std::env::temp_dir()
+                .join("rat-search")
+                .join(CLIPBOARD_HISTORY_FILE_NAME)
+        );
+        assert_eq!(
+            fallback_clipboard_settings_path(),
+            std::env::temp_dir()
+                .join("rat-search")
+                .join(CLIPBOARD_SETTINGS_FILE_NAME)
+        );
+    }
+
+    #[test]
+    fn default_capabilities_allow_clipboard_text_reads() {
+        let capability_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("capabilities")
+            .join("default.json");
+        let contents =
+            fs::read_to_string(capability_path).expect("default capability should be readable");
+
+        assert!(contents.contains("\"clipboard-manager:allow-read-text\""));
+    }
+
+    #[test]
+    fn clipboard_history_enable_and_disable_helpers_persist_settings() {
+        let root = temporary_directory("clipboard-enable-disable");
+        let path = root.join("clipboard-settings.json");
+        let settings = clipboard_settings_state(path.clone(), false);
+
+        set_clipboard_history_enabled_in_state(&settings, true, 2_000)
+            .expect("settings should be enabled");
+        let enabled_file: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("settings should be readable"))
+                .expect("settings json should parse");
+        assert_eq!(enabled_file["enabled"], true);
+        assert_eq!(enabled_file["updated_at_ms"], 2_000);
+
+        set_clipboard_history_enabled_in_state(&settings, false, 3_000)
+            .expect("settings should be disabled");
+        let disabled_file: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("settings should be readable"))
+                .expect("settings json should parse");
+        assert_eq!(disabled_file["enabled"], false);
+        assert_eq!(disabled_file["updated_at_ms"], 3_000);
+
+        fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn clipboard_privacy_status_returns_counts_and_limits_without_text() {
+        let settings_root = temporary_directory("clipboard-status-settings");
+        let history_root = temporary_directory("clipboard-status-history");
+        let settings =
+            clipboard_settings_state(settings_root.join("clipboard-settings.json"), true);
+        let history_path = history_root.join("clipboard-history.json");
+        let history = clipboard_history_state(history_path.clone());
+        record_clipboard_text_in_state(&settings, &history, "ordinary clipboard text", 1_700)
+            .expect("clipboard text should be recorded");
+
+        let status = clipboard_privacy_status_from_state(&settings, &history)
+            .expect("status should be returned");
+        let status_json = serde_json::to_value(&status).expect("status should serialize");
+
+        assert_eq!(status.enabled, true);
+        assert_eq!(status.entry_count, 1);
+        assert_eq!(status.retention_days, 7);
+        assert_eq!(status.max_entries, 100);
+        assert_eq!(status.max_text_bytes, 10_000);
+        assert_eq!(status_json.get("text"), None);
+        assert_eq!(status_json.get("preview"), None);
+        assert_eq!(status_json.get("item_id"), None);
+
+        fs::remove_dir_all(settings_root).expect("temporary directory should be removed");
+        fs::remove_dir_all(history_root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn clear_clipboard_history_helper_removes_entries_and_persists() {
+        let settings_root = temporary_directory("clipboard-clear-settings");
+        let history_root = temporary_directory("clipboard-clear-history");
+        let settings =
+            clipboard_settings_state(settings_root.join("clipboard-settings.json"), true);
+        let history_path = history_root.join("clipboard-history.json");
+        let history = clipboard_history_state(history_path.clone());
+        record_clipboard_text_in_state(&settings, &history, "first copied value", 1_700)
+            .expect("first clipboard text should be recorded");
+        record_clipboard_text_in_state(&settings, &history, "second copied value", 1_800)
+            .expect("second clipboard text should be recorded");
+
+        clear_clipboard_history_in_state(&history).expect("history should be cleared");
+
+        assert!(history.read().expect("history lock").entries().is_empty());
+        assert!(ClipboardHistory::load(history_path).entries().is_empty());
+
+        fs::remove_dir_all(settings_root).expect("temporary directory should be removed");
+        fs::remove_dir_all(history_root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn delete_clipboard_item_helper_removes_one_item_and_persists() {
+        let settings_root = temporary_directory("clipboard-delete-settings");
+        let history_root = temporary_directory("clipboard-delete-history");
+        let settings =
+            clipboard_settings_state(settings_root.join("clipboard-settings.json"), true);
+        let history_path = history_root.join("clipboard-history.json");
+        let history = clipboard_history_state(history_path.clone());
+        record_clipboard_text_in_state(&settings, &history, "first copied value", 1_700)
+            .expect("first clipboard text should be recorded");
+        record_clipboard_text_in_state(&settings, &history, "second copied value", 1_800)
+            .expect("second clipboard text should be recorded");
+        let item_id = history.read().expect("history lock").entries()[1]
+            .id
+            .clone();
+
+        delete_clipboard_item_in_state(&history, &item_id).expect("item should be deleted");
+
+        let loaded = ClipboardHistory::load(history_path);
+        assert_eq!(loaded.entries().len(), 1);
+        assert_ne!(loaded.entries()[0].id, item_id);
+
+        fs::remove_dir_all(settings_root).expect("temporary directory should be removed");
+        fs::remove_dir_all(history_root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn delete_clipboard_item_helper_rejects_unknown_ids() {
+        let history_root = temporary_directory("clipboard-delete-unknown");
+        let history = clipboard_history_state(history_root.join("clipboard-history.json"));
+
+        let error = delete_clipboard_item_in_state(&history, "clip:missing")
+            .expect_err("unknown item should be rejected");
+
+        assert_eq!(error, "Could not complete action");
+
+        fs::remove_dir_all(history_root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn copy_clipboard_item_helpers_return_known_text_and_update_usage() {
+        let settings_root = temporary_directory("clipboard-copy-settings");
+        let history_root = temporary_directory("clipboard-copy-history");
+        let settings =
+            clipboard_settings_state(settings_root.join("clipboard-settings.json"), true);
+        let history_path = history_root.join("clipboard-history.json");
+        let history = clipboard_history_state(history_path.clone());
+        record_clipboard_text_in_state(&settings, &history, "known copied value", 1_700)
+            .expect("clipboard text should be recorded");
+        let item_id = history.read().expect("history lock").entries()[0]
+            .id
+            .clone();
+
+        let text = clipboard_item_text_from_state(&history, &item_id)
+            .expect("known item text should be returned");
+        mark_clipboard_item_copied_in_state(&history, &item_id, 2_000)
+            .expect("known item should be marked copied");
+
+        let loaded = ClipboardHistory::load(history_path);
+        assert_eq!(text, "known copied value");
+        assert_eq!(loaded.entries()[0].id, item_id);
+        assert_eq!(loaded.entries()[0].copied_at_ms, 2_000);
+        assert_eq!(loaded.entries()[0].last_used_ms, Some(2_000));
+        assert_eq!(loaded.entries()[0].use_count, 1);
+
+        fs::remove_dir_all(settings_root).expect("temporary directory should be removed");
+        fs::remove_dir_all(history_root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn copy_clipboard_item_helpers_reject_unknown_ids() {
+        let history_root = temporary_directory("clipboard-copy-unknown");
+        let history = clipboard_history_state(history_root.join("clipboard-history.json"));
+
+        let text_error = clipboard_item_text_from_state(&history, "clip:missing")
+            .expect_err("unknown item text should be rejected");
+        let mark_error = mark_clipboard_item_copied_in_state(&history, "clip:missing", 2_000)
+            .expect_err("unknown item mark should be rejected");
+
+        assert_eq!(text_error, "Could not complete action");
+        assert_eq!(mark_error, "Could not complete action");
+
+        fs::remove_dir_all(history_root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn clipboard_history_save_failure_returns_short_error_without_text() {
+        let history_root = temporary_directory("clipboard-save-failure");
+        let history_path = history_root.join("clipboard-history.json");
+        fs::create_dir_all(&history_path).expect("directory should block file persistence");
+        let history = clipboard_history_state(history_path);
+
+        let error = clear_clipboard_history_in_state(&history)
+            .expect_err("save failure should be reported");
+
+        assert_eq!(error, "Could not save clipboard history");
+
+        fs::remove_dir_all(history_root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn load_clipboard_states_from_paths_tolerates_missing_files() {
+        let root = temporary_directory("missing-clipboard-state");
+        let settings_path = root.join("clipboard-settings.json");
+        let history_path = root.join("clipboard-history.json");
+
+        let (settings, history) =
+            load_clipboard_states_from_paths(settings_path, history_path, 1_700);
+
+        assert!(!settings.read().expect("settings lock").is_enabled());
+        assert!(history.read().expect("history lock").entries().is_empty());
+
+        fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn load_clipboard_states_from_paths_prunes_expired_entries() {
+        let root = temporary_directory("pruned-clipboard-state");
+        let settings_path = root.join("clipboard-settings.json");
+        let history_path = root.join("clipboard-history.json");
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "enabled": true,
+                "max_entries": 100,
+                "max_text_bytes": 10000,
+                "retention_days": 1,
+                "updated_at_ms": 1_700
+            }))
+            .expect("settings should serialize"),
+        )
+        .expect("settings should be written");
+        fs::write(
+            &history_path,
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "entries": [
+                    {
+                        "id": "clip:old",
+                        "text": "old",
+                        "normalized_text": "old",
+                        "preview": "old",
+                        "copied_at_ms": 1_000_u64,
+                        "last_used_ms": null,
+                        "use_count": 0,
+                        "text_len": 3
+                    },
+                    {
+                        "id": "clip:fresh",
+                        "text": "fresh",
+                        "normalized_text": "fresh",
+                        "preview": "fresh",
+                        "copied_at_ms": 86_401_000_u64,
+                        "last_used_ms": null,
+                        "use_count": 0,
+                        "text_len": 5
+                    }
+                ]
+            }))
+            .expect("history should serialize"),
+        )
+        .expect("history should be written");
+
+        let (_, history) =
+            load_clipboard_states_from_paths(settings_path, history_path.clone(), 172_801_000);
+        let history = history.read().expect("history lock");
+
+        assert_eq!(history.entries().len(), 1);
+        assert_eq!(history.entries()[0].id, "clip:fresh");
+        drop(history);
+
+        let persisted = clipboard_history::ClipboardHistory::load(history_path);
+        assert_eq!(persisted.entries().len(), 1);
+        assert_eq!(persisted.entries()[0].id, "clip:fresh");
+
+        fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn load_clipboard_states_from_paths_preserves_non_expired_entries() {
+        let root = temporary_directory("fresh-clipboard-state");
+        let settings_path = root.join("clipboard-settings.json");
+        let history_path = root.join("clipboard-history.json");
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "enabled": false,
+                "max_entries": 100,
+                "max_text_bytes": 10000,
+                "retention_days": 7,
+                "updated_at_ms": 1_700
+            }))
+            .expect("settings should serialize"),
+        )
+        .expect("settings should be written");
+        fs::write(
+            &history_path,
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "entries": [
+                    {
+                        "id": "clip:fresh",
+                        "text": "fresh",
+                        "normalized_text": "fresh",
+                        "preview": "fresh",
+                        "copied_at_ms": 1_000_u64,
+                        "last_used_ms": null,
+                        "use_count": 0,
+                        "text_len": 5
+                    }
+                ]
+            }))
+            .expect("history should serialize"),
+        )
+        .expect("history should be written");
+
+        let (_, history) = load_clipboard_states_from_paths(settings_path, history_path, 2_000);
+        let history = history.read().expect("history lock");
+
+        assert_eq!(history.entries().len(), 1);
+        assert_eq!(history.entries()[0].id, "clip:fresh");
+
+        fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn record_clipboard_text_in_state_skips_when_disabled() {
+        let root = temporary_directory("disabled-clipboard-record");
+        let settings_path = root.join("clipboard-settings.json");
+        let history_path = root.join("clipboard-history.json");
+        let settings = clipboard_settings_state(settings_path, false);
+        let history = clipboard_history_state(history_path.clone());
+
+        let outcome = record_clipboard_text_in_state(&settings, &history, "ordinary text", 1_700)
+            .expect("disabled record should not fail");
+
+        assert_eq!(outcome, ClipboardRecordOutcome::IgnoredDisabled);
+        assert!(history.read().expect("history lock").entries().is_empty());
+        assert!(!history_path.exists());
+
+        fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn record_clipboard_text_in_state_records_and_persists_when_enabled() {
+        let root = temporary_directory("enabled-clipboard-record");
+        let settings_path = root.join("clipboard-settings.json");
+        let history_path = root.join("clipboard-history.json");
+        let settings = clipboard_settings_state(settings_path, true);
+        let history = clipboard_history_state(history_path.clone());
+
+        let outcome = record_clipboard_text_in_state(&settings, &history, "ordinary text", 1_700)
+            .expect("enabled record should succeed");
+
+        assert_eq!(outcome, ClipboardRecordOutcome::Recorded);
+        let loaded = ClipboardHistory::load(history_path);
+        assert_eq!(loaded.entries().len(), 1);
+        assert_eq!(loaded.entries()[0].normalized_text, "ordinary text");
+
+        fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn record_clipboard_text_in_state_does_not_persist_ignored_duplicate() {
+        let root = temporary_directory("duplicate-clipboard-record");
+        let settings_path = root.join("clipboard-settings.json");
+        let history_path = root.join("clipboard-history.json");
+        let settings = clipboard_settings_state(settings_path, true);
+        let history = clipboard_history_state(history_path.clone());
+
+        record_clipboard_text_in_state(&settings, &history, "ordinary text", 1_700)
+            .expect("initial record should succeed");
+        let outcome =
+            record_clipboard_text_in_state(&settings, &history, " ordinary  text ", 1_800)
+                .expect("duplicate record should not fail");
+
+        assert_eq!(outcome, ClipboardRecordOutcome::IgnoredDuplicate);
+        let loaded = ClipboardHistory::load(history_path);
+        assert_eq!(loaded.entries().len(), 1);
+        assert_eq!(loaded.entries()[0].copied_at_ms, 1_700);
+
+        fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn record_clipboard_text_in_state_does_not_persist_sensitive_text() {
+        let root = temporary_directory("sensitive-clipboard-record");
+        let settings_path = root.join("clipboard-settings.json");
+        let history_path = root.join("clipboard-history.json");
+        let settings = clipboard_settings_state(settings_path, true);
+        let history = clipboard_history_state(history_path.clone());
+
+        let outcome =
+            record_clipboard_text_in_state(&settings, &history, "password=example", 1_700)
+                .expect("sensitive record should not fail");
+
+        assert_eq!(outcome, ClipboardRecordOutcome::IgnoredSensitive);
+        assert!(history.read().expect("history lock").entries().is_empty());
+        assert!(!history_path.exists());
+
+        fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn record_clipboard_text_in_state_reports_save_failure_without_text() {
+        let root = temporary_directory("clipboard-save-failure");
+        let settings_path = root.join("clipboard-settings.json");
+        let history_path = root.join("clipboard-history.json");
+        fs::create_dir(&history_path).expect("directory should block file save");
+        let settings = clipboard_settings_state(settings_path, true);
+        let history = clipboard_history_state(history_path);
+
+        let error = record_clipboard_text_in_state(&settings, &history, "ordinary text", 1_700)
+            .expect_err("save should fail");
+
+        assert_eq!(error, "Could not save clipboard history");
+        assert!(!error.contains("ordinary text"));
+
+        fs::remove_dir_all(root).expect("temporary directory should be removed");
     }
 
     #[test]
@@ -854,11 +1721,186 @@ mod tests {
     }
 
     #[test]
+    fn mixed_search_includes_clipboard_results_when_enabled() {
+        let app_catalog = AppCatalog::default();
+        let (settings_root, settings) = clipboard_settings(true);
+        let (history_root, clipboard_history) = clipboard_history(&[("alpha copied text", 1_700)]);
+
+        let results = search_all(
+            &app_catalog,
+            None,
+            Some(&settings),
+            Some(&clipboard_history),
+            None,
+            "alpha",
+            8,
+        );
+
+        assert!(results
+            .iter()
+            .any(|result| result.source == SearchSource::Clipboard));
+
+        fs::remove_dir_all(settings_root).expect("temporary directory should be removed");
+        fs::remove_dir_all(history_root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn mixed_search_excludes_clipboard_results_when_disabled() {
+        let app_catalog = AppCatalog::default();
+        let (settings_root, settings) = clipboard_settings(false);
+        let (history_root, clipboard_history) = clipboard_history(&[("alpha copied text", 1_700)]);
+
+        let results = search_all(
+            &app_catalog,
+            None,
+            Some(&settings),
+            Some(&clipboard_history),
+            None,
+            "alpha",
+            8,
+        );
+
+        assert!(!results
+            .iter()
+            .any(|result| result.source == SearchSource::Clipboard));
+
+        fs::remove_dir_all(settings_root).expect("temporary directory should be removed");
+        fs::remove_dir_all(history_root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn mixed_search_excludes_clipboard_results_for_empty_queries() {
+        let app_catalog = AppCatalog::default();
+        let (settings_root, settings) = clipboard_settings(true);
+        let (history_root, clipboard_history) = clipboard_history(&[("alpha copied text", 1_700)]);
+
+        let results = search_all(
+            &app_catalog,
+            None,
+            Some(&settings),
+            Some(&clipboard_history),
+            None,
+            "   ",
+            8,
+        );
+
+        assert!(!results
+            .iter()
+            .any(|result| result.source == SearchSource::Clipboard));
+
+        fs::remove_dir_all(settings_root).expect("temporary directory should be removed");
+        fs::remove_dir_all(history_root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn mixed_search_keeps_strong_settings_above_clipboard() {
+        let app_catalog = AppCatalog::default();
+        let (settings_root, settings) = clipboard_settings(true);
+        let (history_root, clipboard_history) = clipboard_history(&[("wifi copied text", 1_700)]);
+
+        let results = search_all(
+            &app_catalog,
+            None,
+            Some(&settings),
+            Some(&clipboard_history),
+            None,
+            "wifi",
+            8,
+        );
+
+        assert_eq!(results[0].source, SearchSource::Settings);
+        assert!(results
+            .iter()
+            .any(|result| result.source == SearchSource::Clipboard));
+
+        fs::remove_dir_all(settings_root).expect("temporary directory should be removed");
+        fs::remove_dir_all(history_root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn mixed_search_clipboard_can_rank_above_weak_history() {
+        let app_catalog = AppCatalog::default();
+        let (settings_root, settings) = clipboard_settings(true);
+        let (history_root, clipboard_history) = clipboard_history(&[("alpha copied text", 1_700)]);
+        let history = history(&[("my alpha notes", 1_000, 1)]);
+
+        let results = search_all(
+            &app_catalog,
+            None,
+            Some(&settings),
+            Some(&clipboard_history),
+            Some(&history),
+            "alpha",
+            8,
+        );
+        let clipboard_position = results
+            .iter()
+            .position(|result| result.source == SearchSource::Clipboard)
+            .expect("clipboard result should exist");
+        let history_position = results
+            .iter()
+            .position(|result| result.source == SearchSource::History)
+            .expect("history result should exist");
+
+        assert!(clipboard_position < history_position);
+
+        fs::remove_dir_all(settings_root).expect("temporary directory should be removed");
+        fs::remove_dir_all(history_root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn mixed_search_applies_final_limit_after_clipboard_merge() {
+        let app_catalog = AppCatalog::default();
+        let (settings_root, settings) = clipboard_settings(true);
+        let (history_root, clipboard_history) = clipboard_history(&[("alpha copied text", 1_700)]);
+        let history = history(&[("my alpha notes", 1_000, 1)]);
+
+        let results = search_all(
+            &app_catalog,
+            None,
+            Some(&settings),
+            Some(&clipboard_history),
+            Some(&history),
+            "alpha",
+            1,
+        );
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source, SearchSource::Clipboard);
+
+        fs::remove_dir_all(settings_root).expect("temporary directory should be removed");
+        fs::remove_dir_all(history_root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn mixed_search_falls_back_when_clipboard_state_is_absent() {
+        let app_catalog = AppCatalog::default();
+        let history = history(&[("alpha history", 1_700, 1)]);
+
+        let results = search_all(&app_catalog, None, None, None, Some(&history), "alpha", 8);
+
+        assert!(results
+            .iter()
+            .any(|result| result.source == SearchSource::History));
+        assert!(!results
+            .iter()
+            .any(|result| result.source == SearchSource::Clipboard));
+    }
+
+    #[test]
     fn mixed_search_keeps_strong_app_above_noisy_file_match() {
         let app_catalog = catalog(vec![app("report.desktop", "Report")]);
         let file_index = index(vec![file("/home/sanuk/Documents/Annual Report.pdf")]);
 
-        let results = search_all(&app_catalog, Some(&file_index), None, "report", 8);
+        let results = search_all(
+            &app_catalog,
+            Some(&file_index),
+            None,
+            None,
+            None,
+            "report",
+            8,
+        );
 
         assert_eq!(results[0].source, SearchSource::Applications);
         assert_eq!(results[0].title, "Report");
@@ -873,7 +1915,15 @@ mod tests {
             folder("/home/sanuk/Documents/Reports"),
         ]);
 
-        let results = search_all(&app_catalog, Some(&file_index), None, "report", 1);
+        let results = search_all(
+            &app_catalog,
+            Some(&file_index),
+            None,
+            None,
+            None,
+            "report",
+            1,
+        );
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Reports");
@@ -888,7 +1938,15 @@ mod tests {
         let second_file = file("/home/sanuk/Documents/Beta");
         let file_index = index(vec![second_file, first_file, folder]);
 
-        let results = search_all(&app_catalog, Some(&file_index), None, "alpha", 8);
+        let results = search_all(
+            &app_catalog,
+            Some(&file_index),
+            None,
+            None,
+            None,
+            "alpha",
+            8,
+        );
 
         assert_eq!(
             results
@@ -903,10 +1961,18 @@ mod tests {
     }
 
     #[test]
+    fn source_priority_places_clipboard_between_web_and_history() {
+        assert!(source_priority(&SearchSource::Web) < source_priority(&SearchSource::Clipboard));
+        assert!(
+            source_priority(&SearchSource::Clipboard) < source_priority(&SearchSource::History)
+        );
+    }
+
+    #[test]
     fn mixed_search_falls_back_to_apps_without_file_index() {
         let app_catalog = catalog(vec![app("settings.desktop", "Settings")]);
 
-        let results = search_all(&app_catalog, None, None, "settings", 8);
+        let results = search_all(&app_catalog, None, None, None, None, "settings", 8);
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].source, SearchSource::Applications);
@@ -917,7 +1983,7 @@ mod tests {
         let app_catalog = AppCatalog::default();
         let file_index = index(vec![file("/home/sanuk/Documents/2 plus 2 notes.txt")]);
 
-        let results = search_all(&app_catalog, Some(&file_index), None, "2+2", 8);
+        let results = search_all(&app_catalog, Some(&file_index), None, None, None, "2+2", 8);
 
         assert_eq!(results[0].source, SearchSource::Calculator);
         assert_eq!(results[0].title, "4");
@@ -928,7 +1994,15 @@ mod tests {
         let app_catalog = catalog(vec![app("what-is-rust.desktop", "what is rust")]);
         let history = history(&[("what is rust", 1_700, 10)]);
 
-        let results = search_all(&app_catalog, None, Some(&history), "what is rust", 8);
+        let results = search_all(
+            &app_catalog,
+            None,
+            None,
+            None,
+            Some(&history),
+            "what is rust",
+            8,
+        );
 
         assert_eq!(results[0].source, SearchSource::Applications);
         assert_eq!(results[0].title, "what is rust");
@@ -944,7 +2018,7 @@ mod tests {
     fn mixed_search_includes_settings_exact_match() {
         let app_catalog = AppCatalog::default();
 
-        let results = search_all(&app_catalog, None, None, "wifi", 8);
+        let results = search_all(&app_catalog, None, None, None, None, "wifi", 8);
 
         assert_eq!(results[0].source, SearchSource::Settings);
         assert_eq!(results[0].title, "Wi-Fi");
@@ -954,7 +2028,15 @@ mod tests {
     fn mixed_search_includes_google_question_search() {
         let app_catalog = AppCatalog::default();
 
-        let results = search_all(&app_catalog, None, None, "what is rust tauri", 8);
+        let results = search_all(
+            &app_catalog,
+            None,
+            None,
+            None,
+            None,
+            "what is rust tauri",
+            8,
+        );
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].source, SearchSource::Web);
@@ -966,7 +2048,7 @@ mod tests {
         let app_catalog = AppCatalog::default();
         let history = history(&[("wifi troubleshooting", 1_700, 20)]);
 
-        let results = search_all(&app_catalog, None, Some(&history), "wifi", 8);
+        let results = search_all(&app_catalog, None, None, None, Some(&history), "wifi", 8);
 
         assert_eq!(results[0].source, SearchSource::Settings);
         assert_eq!(results[0].title, "Wi-Fi");
@@ -984,7 +2066,7 @@ mod tests {
         let app_catalog = catalog(vec![app("wifi.desktop", "WiFi Utility")]);
         let history = history(&[("wifi history", 1_700, 3)]);
 
-        let results = search_all(&app_catalog, None, Some(&history), "wifi", 2);
+        let results = search_all(&app_catalog, None, None, None, Some(&history), "wifi", 2);
 
         assert_eq!(results.len(), 2);
         assert_eq!(
@@ -1000,7 +2082,7 @@ mod tests {
     fn mixed_search_falls_back_when_history_is_absent() {
         let app_catalog = AppCatalog::default();
 
-        let results = search_all(&app_catalog, None, None, "wifi", 8);
+        let results = search_all(&app_catalog, None, None, None, None, "wifi", 8);
 
         assert!(results
             .iter()

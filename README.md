@@ -4,9 +4,9 @@ A Spotlight-inspired command palette for Ubuntu Linux, built with Tauri, Rust,
 and Svelte.
 
 Rat Search starts as a resident desktop utility and opens a compact launcher on
-demand. Version 0.3 searches installed applications, files, folders, local
-calculator expressions, Google question searches, GNOME Settings panels, and
-recent search history.
+demand. Version 0.4 searches installed applications, files, folders, local
+calculator expressions, Google question searches, GNOME Settings panels, recent
+search history, and opt-in local text clipboard history.
 
 ## Features
 
@@ -19,12 +19,16 @@ recent search history.
 - Find whitelisted GNOME Settings panels such as Wi-Fi, Bluetooth, Displays,
   Keyboard, and Sound.
 - Reuse recent successful search queries from local history.
+- Opt in to local text clipboard history, search older copied text, copy a
+  stored item back to the system clipboard, delete one item, or clear history.
+- Keep clipboard history local, disabled by default, and filtered with
+  best-effort sensitive text checks.
 - Run the selected result's default action with `Enter`.
 - Reveal file and folder results with `Ctrl+Enter`.
 - Copy file and folder paths with `Ctrl+C` when no search text is selected.
 - Render app icons from the local icon theme when available.
 - Show source-aware app, file, folder, calculator, web, settings, and history
-  icons.
+  icons, including clipboard results.
 - Keep search responsive by scanning files once at startup and searching
   in-memory app/file/folder catalogs plus lightweight history state.
 
@@ -84,14 +88,16 @@ and wait for the launcher hotkey.
 
 ## Startup
 
-Rat Search is intended to work well as a startup application, but v0.3 does not
-auto-enable startup because there is no settings screen or consent flow yet. See
+Rat Search is intended to work well as a startup application, but v0.4 does not
+auto-enable startup. See
 [Local Run, Packaging, and Autostart](docs/local_run_packaging_autostart.md)
 for the prepared startup path and performance notes.
 
 ## Documentation
 
 - [Documentation index](docs/README.md)
+- [Version 0.4 overview](docs/version_0_4.md)
+- [Version 0.4 testing](docs/version_0_4_testing.md)
 - [Version 0.3 overview](docs/version_0_3.md)
 - [Version 0.2 overview](docs/version_0_2.md)
 - [Local Run, Packaging, and Autostart](docs/local_run_packaging_autostart.md)

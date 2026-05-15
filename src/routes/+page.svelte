@@ -10,6 +10,7 @@
     | "calculator"
     | "web"
     | "settings"
+    | "clipboard"
     | "history";
   type SearchAction =
     | "launch_app"
@@ -19,6 +20,8 @@
     | "copy_text"
     | "open_url"
     | "open_setting"
+    | "copy_clipboard_text"
+    | "delete_clipboard_item"
     | "reuse_query";
   type PathAction = "open_path" | "reveal_path" | "copy_path";
   type ShortcutAction = Extract<SearchAction, "reveal_path" | "copy_path">;
@@ -67,6 +70,16 @@
     use_count: number;
   };
 
+  type ClipboardMetadata = {
+    kind: "clipboard";
+    item_id: string;
+    preview: string;
+    copied_at_ms: number;
+    last_used_ms: number | null;
+    use_count: number;
+    text_len: number;
+  };
+
   type SearchMetadata =
     | ApplicationMetadata
     | FileMetadata
@@ -74,6 +87,7 @@
     | CalculatorMetadata
     | WebMetadata
     | SettingMetadata
+    | ClipboardMetadata
     | HistoryMetadata;
 
   type SearchResult = {
@@ -88,6 +102,14 @@
     metadata: SearchMetadata | null;
   };
 
+  type ClipboardPrivacyStatus = {
+    enabled: boolean;
+    entry_count: number;
+    retention_days: number;
+    max_entries: number;
+    max_text_bytes: number;
+  };
+
   let query = $state("");
   let isExpanded = $state(false);
   let isCollapsing = $state(false);
@@ -98,6 +120,11 @@
   let searchError = $state<string | null>(null);
   let actionError = $state<string | null>(null);
   let isRunningAction = $state(false);
+  let isPrivacyPanelOpen = $state(false);
+  let clipboardPrivacyStatus = $state<ClipboardPrivacyStatus | null>(null);
+  let clipboardPrivacyError = $state<string | null>(null);
+  let isClipboardPrivacyBusy = $state(false);
+  let hasConfirmedClipboardEnable = $state(false);
   let searchInput: HTMLInputElement;
   let searchRequestId = 0;
   let requestedExpandedState: boolean | null = null;
@@ -125,6 +152,68 @@
     selectedIndex = -1;
     searchError = null;
     actionError = null;
+  }
+
+  async function refreshClipboardPrivacyStatus() {
+    if (!isTauri()) {
+      return;
+    }
+
+    try {
+      clipboardPrivacyStatus = await invoke<ClipboardPrivacyStatus>(
+        "get_clipboard_privacy_status",
+      );
+      clipboardPrivacyError = null;
+    } catch (error) {
+      console.error("failed to load clipboard privacy status", error);
+      clipboardPrivacyError = "Clipboard status unavailable";
+    }
+  }
+
+  function togglePrivacyPanel() {
+    isPrivacyPanelOpen = !isPrivacyPanelOpen;
+
+    if (isPrivacyPanelOpen) {
+      void refreshClipboardPrivacyStatus();
+    }
+  }
+
+  async function runClipboardPrivacyCommand(command: string) {
+    if (!isTauri() || isClipboardPrivacyBusy) {
+      return;
+    }
+
+    if (command === "enable_clipboard_history" && !hasConfirmedClipboardEnable) {
+      hasConfirmedClipboardEnable = true;
+      clipboardPrivacyError = "Clipboard history is local. Select Enable again.";
+      focusSearchInput();
+      return;
+    }
+
+    isClipboardPrivacyBusy = true;
+    clipboardPrivacyError = null;
+
+    try {
+      await invoke(command);
+
+      if (command === "clear_clipboard_history") {
+        results = results.filter((result) => result.source !== "clipboard");
+        selectedIndex = results.length > 0 ? Math.min(selectedIndex, results.length - 1) : -1;
+      }
+
+      if (command !== "enable_clipboard_history") {
+        hasConfirmedClipboardEnable = false;
+      }
+
+      await refreshClipboardPrivacyStatus();
+      focusSearchInput();
+    } catch (error) {
+      console.error("failed to update clipboard privacy", error);
+      clipboardPrivacyError = "Clipboard action failed";
+      focusSearchInput();
+    } finally {
+      isClipboardPrivacyBusy = false;
+    }
   }
 
   function clearCollapseTimer() {
@@ -303,6 +392,8 @@
         return "symbolic-icon symbolic-web";
       case "settings":
         return "symbolic-icon symbolic-settings";
+      case "clipboard":
+        return "symbolic-icon symbolic-clipboard";
       case "history":
         return "symbolic-icon symbolic-history";
       default:
@@ -324,6 +415,8 @@
         return "Web";
       case "settings":
         return "Set";
+      case "clipboard":
+        return "Clip";
       case "history":
         return "Hist";
     }
@@ -355,6 +448,15 @@
       }
       case "settings":
         return firstSubtitlePart(["System Settings", result.subtitle]);
+      case "clipboard": {
+        const metadata = clipboardMetadata(result);
+        return firstSubtitlePart([
+          result.subtitle,
+          metadata && metadata.use_count > 0
+            ? `Clipboard - used ${metadata.use_count} times`
+            : null,
+        ]);
+      }
       case "history": {
         const metadata = historyMetadata(result);
         return firstSubtitlePart([
@@ -478,12 +580,20 @@
     return result.metadata?.kind === "history" ? result.metadata : null;
   }
 
+  function clipboardMetadata(result: SearchResult) {
+    return result.metadata?.kind === "clipboard" ? result.metadata : null;
+  }
+
   function actionFailureMessage(action: SearchAction) {
     if (action === "launch_app") {
       return "Could not launch app";
     }
 
     if (action === "copy_path" || action === "copy_text") {
+      return "Could not complete action";
+    }
+
+    if (action === "copy_clipboard_text" || action === "delete_clipboard_item") {
       return "Could not complete action";
     }
 
@@ -496,9 +606,25 @@
   }
 
   function recordSearchHistory(queryBeforeAction: string) {
+    if (!queryBeforeAction.trim()) {
+      return;
+    }
+
     void invoke("record_search_history", { query: queryBeforeAction }).catch((error) => {
       console.error("failed to record search history", error);
     });
+  }
+
+  function removeResultById(resultId: string) {
+    const nextResults = results.filter((result) => result.id !== resultId);
+    results = nextResults;
+
+    if (nextResults.length === 0) {
+      selectedIndex = -1;
+      return;
+    }
+
+    selectedIndex = Math.min(selectedIndex, nextResults.length - 1);
   }
 
   async function runSelectedResultAction(actionOverride?: ShortcutAction) {
@@ -569,6 +695,34 @@
 
           await invoke("open_setting", { settingId: metadata.setting_id });
           break;
+        }
+
+        case "copy_clipboard_text": {
+          const metadata = clipboardMetadata(selected);
+
+          if (!metadata) {
+            failSelectedAction(action);
+            return;
+          }
+
+          await invoke("copy_clipboard_item", { itemId: metadata.item_id });
+          break;
+        }
+
+        case "delete_clipboard_item": {
+          const metadata = clipboardMetadata(selected);
+
+          if (!metadata) {
+            failSelectedAction(action);
+            return;
+          }
+
+          await invoke("delete_clipboard_item", { itemId: metadata.item_id });
+          removeResultById(selected.id);
+          searchError = null;
+          actionError = null;
+          focusSearchInput();
+          return;
         }
 
         case "reuse_query": {
@@ -725,7 +879,60 @@
         spellcheck="false"
         onkeydown={handleKeydown}
       />
+      <button
+        class:active={isPrivacyPanelOpen}
+        class="privacy-toggle"
+        type="button"
+        aria-label="Clipboard privacy"
+        onclick={togglePrivacyPanel}
+      >
+        <span class="symbolic-icon symbolic-clipboard"></span>
+      </button>
     </div>
+
+    {#if isPrivacyPanelOpen}
+      <div class="privacy-panel" role="dialog" aria-label="Clipboard privacy">
+        <div class="privacy-panel-header">
+          <span>Clipboard</span>
+          <strong>{clipboardPrivacyStatus?.enabled ? "On" : "Off"}</strong>
+        </div>
+        <div class="privacy-panel-details">
+          <span>{clipboardPrivacyStatus?.entry_count ?? 0} items</span>
+          <span>{clipboardPrivacyStatus?.retention_days ?? 7} days</span>
+          <span>{clipboardPrivacyStatus?.max_entries ?? 100} max</span>
+          <span>{clipboardPrivacyStatus?.max_text_bytes ?? 10000} bytes</span>
+        </div>
+        {#if clipboardPrivacyError}
+          <div class="privacy-panel-note">{clipboardPrivacyError}</div>
+        {/if}
+        <div class="privacy-panel-actions">
+          {#if clipboardPrivacyStatus?.enabled}
+            <button
+              type="button"
+              disabled={isClipboardPrivacyBusy}
+              onclick={() => runClipboardPrivacyCommand("disable_clipboard_history")}
+            >
+              Disable
+            </button>
+          {:else}
+            <button
+              type="button"
+              disabled={isClipboardPrivacyBusy}
+              onclick={() => runClipboardPrivacyCommand("enable_clipboard_history")}
+            >
+              Enable
+            </button>
+          {/if}
+          <button
+            type="button"
+            disabled={isClipboardPrivacyBusy}
+            onclick={() => runClipboardPrivacyCommand("clear_clipboard_history")}
+          >
+            Clear
+          </button>
+        </div>
+      </div>
+    {/if}
 
     {#if isExpanded && !isVisuallyCompact}
       <div class:collapsing={isCollapsing} class="results-region">
@@ -933,6 +1140,89 @@
   .search-input::placeholder {
     color: rgba(58, 60, 67, 0.45);
     opacity: 1;
+  }
+
+  .privacy-toggle {
+    width: 32px;
+    height: 32px;
+    flex: 0 0 auto;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: rgba(58, 60, 67, 0.62);
+  }
+
+  .privacy-toggle.active,
+  .privacy-toggle:hover {
+    background: rgba(58, 60, 67, 0.1);
+    color: rgba(18, 18, 20, 0.84);
+  }
+
+  .privacy-panel {
+    position: absolute;
+    z-index: 4;
+    top: 58px;
+    right: 12px;
+    width: min(300px, calc(100% - 24px));
+    padding: 10px;
+    overflow: hidden;
+    border: 1px solid rgba(58, 60, 67, 0.12);
+    border-radius: 10px;
+    background: rgba(250, 251, 252, 0.98);
+    box-shadow: 0 10px 24px rgba(0, 0, 0, 0.16);
+  }
+
+  .privacy-panel-header,
+  .privacy-panel-details,
+  .privacy-panel-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .privacy-panel-header {
+    justify-content: space-between;
+    color: rgba(18, 18, 20, 0.9);
+    font-size: 13px;
+    font-weight: 650;
+  }
+
+  .privacy-panel-details {
+    flex-wrap: wrap;
+    margin-top: 7px;
+    color: rgba(58, 60, 67, 0.66);
+    font-size: 11px;
+    line-height: 1.2;
+  }
+
+  .privacy-panel-note {
+    margin-top: 8px;
+    color: rgba(127, 82, 20, 0.92);
+    font-size: 11px;
+    line-height: 1.25;
+  }
+
+  .privacy-panel-actions {
+    justify-content: flex-end;
+    margin-top: 10px;
+  }
+
+  .privacy-panel-actions button {
+    height: 26px;
+    padding: 0 10px;
+    border: 0;
+    border-radius: 7px;
+    background: rgba(12, 113, 238, 0.12);
+    color: rgba(12, 83, 173, 0.96);
+    font-size: 12px;
+    font-weight: 650;
+  }
+
+  .privacy-panel-actions button:disabled {
+    opacity: 0.54;
   }
 
   .results-region {
@@ -1216,6 +1506,36 @@
     opacity: 0.78;
   }
 
+  .symbolic-clipboard {
+    width: 18px;
+    height: 21px;
+  }
+
+  .symbolic-clipboard::before {
+    content: "";
+    position: absolute;
+    right: 2px;
+    bottom: 1px;
+    left: 2px;
+    height: 16px;
+    border: 1.8px solid currentColor;
+    border-radius: 3px;
+    opacity: 0.78;
+  }
+
+  .symbolic-clipboard::after {
+    content: "";
+    position: absolute;
+    top: 1px;
+    left: 5px;
+    width: 8px;
+    height: 5px;
+    border-radius: 3px 3px 1px 1px;
+    background: currentColor;
+    box-shadow: 0 7px 0 -3px currentColor;
+    opacity: 0.74;
+  }
+
   .symbolic-history {
     width: 21px;
     height: 21px;
@@ -1389,6 +1709,33 @@
 
     .search-input::placeholder {
       color: rgba(246, 247, 249, 0.45);
+    }
+
+    .privacy-toggle {
+      color: rgba(246, 247, 249, 0.62);
+    }
+
+    .privacy-toggle.active,
+    .privacy-toggle:hover {
+      background: rgba(246, 247, 249, 0.12);
+      color: rgba(246, 247, 249, 0.9);
+    }
+
+    .privacy-panel {
+      border-color: rgba(246, 247, 249, 0.14);
+      background: rgba(45, 46, 50, 0.98);
+    }
+
+    .privacy-panel-header {
+      color: rgba(246, 247, 249, 0.94);
+    }
+
+    .privacy-panel-details {
+      color: rgba(246, 247, 249, 0.62);
+    }
+
+    .privacy-panel-note {
+      color: rgba(245, 190, 112, 0.95);
     }
 
     .result-row {
