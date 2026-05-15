@@ -324,6 +324,21 @@ fn spawn_prepared_command(command: &file_actions::PreparedCommand) -> Result<(),
         })
 }
 
+fn spawn_calculator_command(command: &calculator::PreparedCalculatorCommand) -> Result<(), String> {
+    Command::new(&command.program)
+        .args(&command.args)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| {
+            eprintln!(
+                "failed to open calculator with '{} {}': {error}",
+                command.program,
+                command.args.join(" ")
+            );
+            "Could not open calculator".to_owned()
+        })
+}
+
 fn validate_copy_text(text: &str) -> Result<&str, String> {
     if text.trim().is_empty() {
         return Err("Text is required".to_owned());
@@ -762,6 +777,27 @@ fn copy_text(app: tauri::AppHandle, text: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn open_calculator_app(
+    app: tauri::AppHandle,
+    expression: String,
+    result: String,
+    copy_text: String,
+) -> Result<(), String> {
+    let command = calculator::prepare_calculator_app_command(&expression, &result, &copy_text)?;
+
+    spawn_calculator_command(&command)?;
+
+    if command.copy_fallback {
+        app.clipboard().write_text(copy_text).map_err(|error| {
+            eprintln!("failed to copy calculator fallback text: {error}");
+            "Could not open calculator".to_owned()
+        })?;
+    }
+
+    hide_launcher_for_app(&app)
+}
+
+#[tauri::command]
 fn enable_clipboard_history(
     settings: tauri::State<'_, ClipboardSettingsState>,
 ) -> Result<(), String> {
@@ -1066,6 +1102,7 @@ pub fn run() {
             hide_launcher,
             launch_app,
             open_in_code,
+            open_calculator_app,
             open_path,
             open_setting,
             open_url,
@@ -1723,6 +1760,20 @@ mod tests {
         assert_eq!(
             validate_copy_text(" calculator result ").expect("text should validate"),
             " calculator result "
+        );
+    }
+
+    #[test]
+    fn calculator_spawn_failure_maps_to_short_error() {
+        let command = calculator::PreparedCalculatorCommand {
+            program: "/tmp/rat-search-missing-calculator".to_owned(),
+            args: Vec::new(),
+            copy_fallback: true,
+        };
+
+        assert_eq!(
+            spawn_calculator_command(&command).expect_err("missing executable should fail"),
+            "Could not open calculator"
         );
     }
 

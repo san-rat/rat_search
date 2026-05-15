@@ -1,11 +1,21 @@
 #![allow(dead_code)]
 
+use std::{env, path::PathBuf};
+
 use crate::{
     search_result::{SearchAction, SearchMetadata, SearchResult, SearchSource},
     settings,
 };
 
 const CALCULATOR_SCORE: i32 = 980;
+const CALCULATOR_EXECUTABLES: &[&str] = &["gnome-calculator", "kcalc", "qalculate-gtk"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedCalculatorCommand {
+    pub(crate) program: String,
+    pub(crate) args: Vec<String>,
+    pub(crate) copy_fallback: bool,
+}
 
 pub(crate) fn search_calculator(query: &str, limit: usize) -> Vec<SearchResult> {
     let limit = settings::normalize_result_limit(limit);
@@ -41,6 +51,56 @@ pub(crate) fn search_calculator(query: &str, limit: usize) -> Vec<SearchResult> 
             copy_text: result,
         }),
     }]
+}
+
+pub(crate) fn prepare_calculator_app_command(
+    expression: &str,
+    result: &str,
+    copy_text: &str,
+) -> Result<PreparedCalculatorCommand, String> {
+    validate_calculator_action_metadata(expression, result, copy_text)?;
+
+    let Some(program) = resolve_calculator_executable_from_path(&path_entries()) else {
+        return Err("Could not open calculator".to_owned());
+    };
+
+    Ok(PreparedCalculatorCommand {
+        program,
+        args: Vec::new(),
+        copy_fallback: true,
+    })
+}
+
+fn validate_calculator_action_metadata(
+    expression: &str,
+    result: &str,
+    copy_text: &str,
+) -> Result<(), String> {
+    if expression.trim().is_empty() || result.trim().is_empty() || copy_text.trim().is_empty() {
+        return Err("Could not open calculator".to_owned());
+    }
+
+    Ok(())
+}
+
+fn path_entries() -> Vec<PathBuf> {
+    env::var_os("PATH")
+        .map(|path| env::split_paths(&path).collect())
+        .unwrap_or_default()
+}
+
+fn resolve_calculator_executable_from_path(path_entries: &[PathBuf]) -> Option<String> {
+    CALCULATOR_EXECUTABLES
+        .iter()
+        .find(|executable| executable_exists(path_entries, executable))
+        .map(|executable| (*executable).to_owned())
+}
+
+fn executable_exists(path_entries: &[PathBuf], executable: &str) -> bool {
+    path_entries
+        .iter()
+        .map(|entry| entry.join(executable))
+        .any(|candidate| candidate.is_file())
 }
 
 fn looks_like_calculator_query(query: &str) -> bool {
@@ -238,12 +298,35 @@ impl Parser {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::SystemTime,
+    };
+
     use serde_json::json;
 
     use super::*;
 
     fn calculator_result(query: &str) -> Option<SearchResult> {
         search_calculator(query, 8).into_iter().next()
+    }
+
+    fn temporary_directory(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system time should be after Unix epoch")
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("rat-search-{name}-{}-{unique}", std::process::id()));
+
+        fs::create_dir_all(&path).expect("temporary directory should be created");
+
+        path
+    }
+
+    fn temporary_executable(root: &Path, name: &str) {
+        fs::write(root.join(name), "#!/bin/sh\n").expect("temporary executable should be written");
     }
 
     #[test]
@@ -349,6 +432,84 @@ mod tests {
                     "copy_text": "4"
                 }
             })
+        );
+    }
+
+    #[test]
+    fn calculator_command_preparation_picks_documented_executable_order() {
+        let root = temporary_directory("calculator-executables");
+        temporary_executable(&root, "qalculate-gtk");
+        temporary_executable(&root, "kcalc");
+        temporary_executable(&root, "gnome-calculator");
+
+        assert_eq!(
+            resolve_calculator_executable_from_path(&[root.clone()]),
+            Some("gnome-calculator".to_owned())
+        );
+
+        fs::remove_file(root.join("gnome-calculator"))
+            .expect("temporary gnome calculator executable should be removed");
+        assert_eq!(
+            resolve_calculator_executable_from_path(&[root.clone()]),
+            Some("kcalc".to_owned())
+        );
+
+        fs::remove_file(root.join("kcalc")).expect("temporary kcalc executable should be removed");
+        assert_eq!(
+            resolve_calculator_executable_from_path(&[root.clone()]),
+            Some("qalculate-gtk".to_owned())
+        );
+
+        fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn calculator_command_does_not_interpolate_expression_into_shell_string() {
+        let command = PreparedCalculatorCommand {
+            program: "gnome-calculator".to_owned(),
+            args: Vec::new(),
+            copy_fallback: true,
+        };
+
+        assert_eq!(command.program, "gnome-calculator");
+        assert!(command.args.is_empty());
+    }
+
+    #[test]
+    fn unsupported_calculator_prefill_falls_back_to_plain_launch() {
+        let root = temporary_directory("calculator-plain-launch");
+        temporary_executable(&root, "gnome-calculator");
+        let program =
+            resolve_calculator_executable_from_path(&[root.clone()]).expect("calculator resolves");
+        let command = PreparedCalculatorCommand {
+            program,
+            args: Vec::new(),
+            copy_fallback: true,
+        };
+
+        assert_eq!(command.args, Vec::<String>::new());
+        assert!(command.copy_fallback);
+
+        fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn calculator_action_metadata_validation_uses_existing_copy_text() {
+        validate_calculator_action_metadata("2+2", "4", "4").expect("metadata should validate");
+
+        assert_eq!(
+            validate_calculator_action_metadata("2+2", "4", "   ")
+                .expect_err("empty copy fallback should be rejected"),
+            "Could not open calculator"
+        );
+    }
+
+    #[test]
+    fn missing_calculator_executable_maps_to_short_error() {
+        assert_eq!(
+            resolve_calculator_executable_from_path(&[]),
+            None,
+            "empty PATH should not resolve calculator"
         );
     }
 }
