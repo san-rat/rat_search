@@ -10,6 +10,7 @@
     | "calculator"
     | "web"
     | "settings"
+    | "clipboard"
     | "history";
   type SearchAction =
     | "launch_app"
@@ -19,6 +20,8 @@
     | "copy_text"
     | "open_url"
     | "open_setting"
+    | "copy_clipboard_text"
+    | "delete_clipboard_item"
     | "reuse_query";
   type PathAction = "open_path" | "reveal_path" | "copy_path";
   type ShortcutAction = Extract<SearchAction, "reveal_path" | "copy_path">;
@@ -67,6 +70,16 @@
     use_count: number;
   };
 
+  type ClipboardMetadata = {
+    kind: "clipboard";
+    item_id: string;
+    preview: string;
+    copied_at_ms: number;
+    last_used_ms: number | null;
+    use_count: number;
+    text_len: number;
+  };
+
   type SearchMetadata =
     | ApplicationMetadata
     | FileMetadata
@@ -74,6 +87,7 @@
     | CalculatorMetadata
     | WebMetadata
     | SettingMetadata
+    | ClipboardMetadata
     | HistoryMetadata;
 
   type SearchResult = {
@@ -324,6 +338,8 @@
         return "Web";
       case "settings":
         return "Set";
+      case "clipboard":
+        return "Clip";
       case "history":
         return "Hist";
     }
