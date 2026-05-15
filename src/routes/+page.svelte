@@ -317,6 +317,8 @@
         return "symbolic-icon symbolic-web";
       case "settings":
         return "symbolic-icon symbolic-settings";
+      case "clipboard":
+        return "symbolic-icon symbolic-clipboard";
       case "history":
         return "symbolic-icon symbolic-history";
       default:
@@ -371,6 +373,15 @@
       }
       case "settings":
         return firstSubtitlePart(["System Settings", result.subtitle]);
+      case "clipboard": {
+        const metadata = clipboardMetadata(result);
+        return firstSubtitlePart([
+          result.subtitle,
+          metadata && metadata.use_count > 0
+            ? `Clipboard - used ${metadata.use_count} times`
+            : null,
+        ]);
+      }
       case "history": {
         const metadata = historyMetadata(result);
         return firstSubtitlePart([
@@ -492,6 +503,10 @@
 
   function historyMetadata(result: SearchResult) {
     return result.metadata?.kind === "history" ? result.metadata : null;
+  }
+
+  function clipboardMetadata(result: SearchResult) {
+    return result.metadata?.kind === "clipboard" ? result.metadata : null;
   }
 
   function actionFailureMessage(action: SearchAction) {
@@ -1230,6 +1245,36 @@
     border-radius: 50%;
     background: currentColor;
     opacity: 0.78;
+  }
+
+  .symbolic-clipboard {
+    width: 18px;
+    height: 21px;
+  }
+
+  .symbolic-clipboard::before {
+    content: "";
+    position: absolute;
+    right: 2px;
+    bottom: 1px;
+    left: 2px;
+    height: 16px;
+    border: 1.8px solid currentColor;
+    border-radius: 3px;
+    opacity: 0.78;
+  }
+
+  .symbolic-clipboard::after {
+    content: "";
+    position: absolute;
+    top: 1px;
+    left: 5px;
+    width: 8px;
+    height: 5px;
+    border-radius: 3px 3px 1px 1px;
+    background: currentColor;
+    box-shadow: 0 7px 0 -3px currentColor;
+    opacity: 0.74;
   }
 
   .symbolic-history {
