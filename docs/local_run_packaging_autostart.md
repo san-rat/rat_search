@@ -1,6 +1,6 @@
 # Local Run, Packaging, and Autostart
 
-This guide covers the v0.4 local run, Linux packaging path, and startup
+This guide covers the v0.5 local run, Linux packaging path, and startup
 preparation for Rat Search.
 
 ## Local Development
@@ -20,6 +20,10 @@ Expected behavior:
   shortcut to `rat-search toggle`.
 - Search results use in-memory app and file/folder catalogs scanned at startup,
   plus lightweight search history and clipboard state loaded from app data.
+- `open <folder>` and `open <code-like-file>` results open in Visual Studio
+  Code when available, with system-opener fallback.
+- Calculator results open the desktop calculator app, with clipboard fallback
+  when expression prefill is unavailable.
 - Clipboard history starts disabled and must be enabled from the launcher before
   text clipboard changes are recorded.
 
@@ -48,7 +52,7 @@ Linux build artifacts are written under:
 src-tauri/target/release/bundle/
 ```
 
-Version 0.4 builds Debian and RPM packages by default:
+Version 0.5 builds Debian and RPM packages by default:
 
 ```text
 src-tauri/target/release/bundle/deb/
@@ -62,10 +66,10 @@ ready for the hotkey.
 ## Autostart Preparation
 
 Autostart is useful for Rat Search because the app should already be warm when
-the user presses the launcher hotkey. Version 0.3 prepares for that workflow but
+the user presses the launcher hotkey. Version 0.5 prepares for that workflow but
 does not enable it automatically.
 
-Startup is not auto-enabled in this step because there is no settings screen or
+Startup is not auto-enabled in this release because there is no settings screen or
 explicit consent flow yet. A later settings step can use the official Tauri v2
 autostart plugin:
 
@@ -86,11 +90,11 @@ remain resident with the window hidden after startup.
 Autostart means Rat Search uses some RAM while idle. CPU use should be near zero
 after initial startup work finishes.
 
-The main startup costs in v0.4 are scanning installed `.desktop` application
+The main startup costs in v0.5 are scanning installed `.desktop` application
 entries, indexing conservative user folders once, loading lightweight search
 history, and loading clipboard settings/history from app data. Clipboard polling
 runs only as a lightweight text read loop, and storage remains inactive until
 clipboard history is enabled.
 
-The v0.4 acceptance target is that Rat Search remains comfortable on an Ubuntu
+The v0.5 acceptance target is that Rat Search remains comfortable on an Ubuntu
 machine with 8GB RAM.

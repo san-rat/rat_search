@@ -4,7 +4,7 @@ A Spotlight-inspired command palette for Ubuntu Linux, built with Tauri, Rust,
 and Svelte.
 
 Rat Search starts as a resident desktop utility and opens a compact launcher on
-demand. Version 0.4 searches installed applications, files, folders, local
+demand. Version 0.5 searches installed applications, files, folders, local
 calculator expressions, Google question searches, GNOME Settings panels, recent
 search history, and opt-in local text clipboard history.
 
@@ -13,7 +13,17 @@ search history, and opt-in local text clipboard history.
 - Search and launch installed Linux desktop applications.
 - Search files and folders by name from `Desktop`, `Documents`, `Downloads`,
   and `Pictures`.
-- Evaluate local arithmetic expressions and copy calculator results.
+- Evaluate local arithmetic expressions and open the desktop calculator with
+  `Enter`.
+- Search `open <folder>` to open matching folders in Visual Studio Code.
+- Search `open <code-like-file>` to open matching code-like files in Visual
+  Studio Code.
+- Search `open <non-code-file>` to open matching PDFs, images, videos, audio,
+  archives, and other non-code files with the system opener.
+- Keep normal file/folder searches without `open` on the existing default
+  opener.
+- Fall back to the system opener when VS Code is missing or cannot open the
+  selected item.
 - Open Google searches for question-style queries, including sentences ending
   in `?` or containing whole words such as `what`, `how`, or `should`.
 - Find whitelisted GNOME Settings panels such as Wi-Fi, Bluetooth, Displays,
@@ -88,16 +98,28 @@ and wait for the launcher hotkey.
 
 ## Startup
 
-Rat Search is intended to work well as a startup application, but v0.4 does not
+Rat Search is intended to work well as a startup application, but v0.5 does not
 auto-enable startup. See
 [Local Run, Packaging, and Autostart](docs/local_run_packaging_autostart.md)
 for the prepared startup path and performance notes.
 
+## Version 0.5 Notes
+
+The `open` prefix is the only VS Code intent in v0.5. Rat Search does not add
+YouTube, GitHub, terminal, note, `code <path>`, `calc <expr>`, user-defined
+quick keys, user-defined commands, arbitrary shell execution, or destructive
+actions.
+
+Calculator expression prefill depends on installed calculator support. When a
+safe prefill form is not available, Rat Search opens the calculator and copies
+the existing calculator fallback text.
+
+Version 0.5 preserves opt-in local clipboard history. Clipboard history remains
+local-only and disabled by default.
+
 ## Documentation
 
 - [Documentation index](docs/README.md)
-- [Version 0.4 overview](docs/version_0_4.md)
-- [Version 0.4 testing](docs/version_0_4_testing.md)
-- [Version 0.3 overview](docs/version_0_3.md)
-- [Version 0.2 overview](docs/version_0_2.md)
+- [Version 0.5 overview](docs/version_0_5.md)
+- [Version 0.5 testing](docs/version_0_5_testing.md)
 - [Local Run, Packaging, and Autostart](docs/local_run_packaging_autostart.md)

@@ -15,15 +15,17 @@
   type SearchAction =
     | "launch_app"
     | "open_path"
+    | "open_in_code"
     | "reveal_path"
     | "copy_path"
     | "copy_text"
+    | "open_calculator_app"
     | "open_url"
     | "open_setting"
     | "copy_clipboard_text"
     | "delete_clipboard_item"
     | "reuse_query";
-  type PathAction = "open_path" | "reveal_path" | "copy_path";
+  type PathAction = "open_path" | "open_in_code" | "reveal_path" | "copy_path";
   type ShortcutAction = Extract<SearchAction, "reveal_path" | "copy_path">;
 
   type ApplicationMetadata = {
@@ -540,7 +542,12 @@
   }
 
   function isPathAction(action: SearchAction): action is PathAction {
-    return action === "open_path" || action === "reveal_path" || action === "copy_path";
+    return (
+      action === "open_path" ||
+      action === "open_in_code" ||
+      action === "reveal_path" ||
+      action === "copy_path"
+    );
   }
 
   function selectedResultCanRunShortcut(action: ShortcutAction) {
@@ -591,6 +598,14 @@
 
     if (action === "copy_path" || action === "copy_text") {
       return "Could not complete action";
+    }
+
+    if (action === "open_in_code") {
+      return "Could not open item";
+    }
+
+    if (action === "open_calculator_app") {
+      return "Could not open calculator";
     }
 
     if (action === "copy_clipboard_text" || action === "delete_clipboard_item") {
@@ -651,6 +666,7 @@
           break;
 
         case "open_path":
+        case "open_in_code":
         case "reveal_path":
         case "copy_path":
           if (!selected.path || !isFileSystemResult(selected)) {
@@ -670,6 +686,22 @@
           }
 
           await invoke("copy_text", { text: metadata.copy_text });
+          break;
+        }
+
+        case "open_calculator_app": {
+          const metadata = calculatorMetadata(selected);
+
+          if (!metadata) {
+            failSelectedAction(action);
+            return;
+          }
+
+          await invoke("open_calculator_app", {
+            expression: metadata.expression,
+            result: metadata.result,
+            copyText: metadata.copy_text,
+          });
           break;
         }
 
