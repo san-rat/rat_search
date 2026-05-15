@@ -98,7 +98,7 @@ and wait for the launcher hotkey.
 
 ## Startup
 
-Rat Search is intended to work well as a startup application, but v0.4 does not
+Rat Search is intended to work well as a startup application, but v0.5 does not
 auto-enable startup. See
 [Local Run, Packaging, and Autostart](docs/local_run_packaging_autostart.md)
 for the prepared startup path and performance notes.
@@ -114,16 +114,12 @@ Calculator expression prefill depends on installed calculator support. When a
 safe prefill form is not available, Rat Search opens the calculator and copies
 the existing calculator fallback text.
 
-Version 0.4 clipboard history remains opt-in, local-only, and disabled by
-default.
+Version 0.5 preserves opt-in local clipboard history. Clipboard history remains
+local-only and disabled by default.
 
 ## Documentation
 
 - [Documentation index](docs/README.md)
 - [Version 0.5 overview](docs/version_0_5.md)
 - [Version 0.5 testing](docs/version_0_5_testing.md)
-- [Version 0.4 overview](docs/version_0_4.md)
-- [Version 0.4 testing](docs/version_0_4_testing.md)
-- [Version 0.3 overview](docs/version_0_3.md)
-- [Version 0.2 overview](docs/version_0_2.md)
 - [Local Run, Packaging, and Autostart](docs/local_run_packaging_autostart.md)
