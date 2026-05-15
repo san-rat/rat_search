@@ -20,9 +20,11 @@ pub(crate) enum SearchSource {
 pub(crate) enum SearchAction {
     LaunchApp,
     OpenPath,
+    OpenInCode,
     RevealPath,
     CopyPath,
     CopyText,
+    OpenCalculatorApp,
     CopyClipboardText,
     DeleteClipboardItem,
     OpenUrl,
@@ -138,6 +140,10 @@ mod tests {
             json!("open_path")
         );
         assert_eq!(
+            serde_json::to_value(SearchAction::OpenInCode).expect("action should serialize"),
+            json!("open_in_code")
+        );
+        assert_eq!(
             serde_json::to_value(SearchAction::RevealPath).expect("action should serialize"),
             json!("reveal_path")
         );
@@ -148,6 +154,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(SearchAction::CopyText).expect("action should serialize"),
             json!("copy_text")
+        );
+        assert_eq!(
+            serde_json::to_value(SearchAction::OpenCalculatorApp).expect("action should serialize"),
+            json!("open_calculator_app")
         );
         assert_eq!(
             serde_json::to_value(SearchAction::CopyClipboardText).expect("action should serialize"),

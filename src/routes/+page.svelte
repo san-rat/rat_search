@@ -15,9 +15,11 @@
   type SearchAction =
     | "launch_app"
     | "open_path"
+    | "open_in_code"
     | "reveal_path"
     | "copy_path"
     | "copy_text"
+    | "open_calculator_app"
     | "open_url"
     | "open_setting"
     | "copy_clipboard_text"
