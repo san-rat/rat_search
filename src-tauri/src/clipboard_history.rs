@@ -112,6 +112,13 @@ impl ClipboardHistory {
         history
     }
 
+    pub(crate) fn empty(path: PathBuf) -> Self {
+        Self {
+            path,
+            entries: Vec::new(),
+        }
+    }
+
     pub(crate) fn save(&self) -> Result<(), String> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|error| {

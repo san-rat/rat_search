@@ -43,6 +43,7 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
 
 type FileIndexState = Arc<RwLock<FileIndex>>;
+type AppCatalogState = Arc<RwLock<AppCatalog>>;
 type ClipboardHistoryState = Arc<RwLock<ClipboardHistory>>;
 type ClipboardSettingsState = Arc<RwLock<ClipboardSettings>>;
 type SearchHistoryState = Arc<RwLock<SearchHistory>>;
@@ -58,6 +59,7 @@ struct ClipboardPrivacyStatus {
 
 const LAUNCHER_WINDOW_LABEL: &str = "main";
 const LAUNCHER_SHOWN_EVENT: &str = "launcher:shown";
+const LAUNCHER_CATALOG_READY_EVENT: &str = "launcher:catalog-ready";
 const TOGGLE_ARG: &str = "toggle";
 const FOREGROUND_ARG: &str = "foreground";
 const CLIPBOARD_HISTORY_FILE_NAME: &str = "clipboard-history.json";
@@ -812,6 +814,26 @@ fn load_clipboard_states(
     load_clipboard_states_from_paths(settings_path, history_path, current_time_ms())
 }
 
+fn load_foreground_clipboard_states(
+    app: &tauri::AppHandle,
+) -> (ClipboardSettingsState, ClipboardHistoryState) {
+    let settings_path = clipboard_settings_path(app).unwrap_or_else(|error| {
+        eprintln!("failed to resolve clipboard settings path: {error}");
+        fallback_clipboard_settings_path()
+    });
+    let history_path = clipboard_history_path(app).unwrap_or_else(|error| {
+        eprintln!("failed to resolve clipboard history path: {error}");
+        fallback_clipboard_history_path()
+    });
+
+    dev_log("foreground mode: clipboard history load skipped");
+
+    (
+        Arc::new(RwLock::new(ClipboardSettings::disabled(settings_path))),
+        Arc::new(RwLock::new(ClipboardHistory::empty(history_path))),
+    )
+}
+
 fn load_clipboard_states_from_paths(
     settings_path: PathBuf,
     history_path: PathBuf,
@@ -1266,6 +1288,30 @@ fn record_search_history(
     record_search_history_in_state(&history, &query, current_time_ms())
 }
 
+fn start_app_catalog_scan(app_catalog: AppCatalogState, app_handle: Option<tauri::AppHandle>) {
+    thread::spawn(move || {
+        let scanned_catalog = AppCatalog::scan();
+        let scanned_count = scanned_catalog.len();
+
+        match app_catalog.write() {
+            Ok(mut catalog) => {
+                *catalog = scanned_catalog;
+                dev_log(format!(
+                    "app catalog scan: stored {scanned_count} application records"
+                ));
+                if let Some(app_handle) = app_handle {
+                    if let Err(error) = app_handle.emit(LAUNCHER_CATALOG_READY_EVENT, ()) {
+                        eprintln!("failed to emit {LAUNCHER_CATALOG_READY_EVENT}: {error}");
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("failed to store app catalog scan results: {error}");
+            }
+        }
+    });
+}
+
 fn start_file_index_scan(file_index: FileIndexState) {
     thread::spawn(move || {
         let roots = file_index::default_index_roots();
@@ -1386,7 +1432,7 @@ fn normalize_search_text(value: &str) -> String {
 
 #[tauri::command]
 fn search(
-    catalog: tauri::State<'_, AppCatalog>,
+    catalog: tauri::State<'_, AppCatalogState>,
     file_index: tauri::State<'_, FileIndexState>,
     clipboard_settings: tauri::State<'_, ClipboardSettingsState>,
     clipboard_history: tauri::State<'_, ClipboardHistoryState>,
@@ -1394,6 +1440,13 @@ fn search(
     query: String,
     limit: usize,
 ) -> Vec<SearchResult> {
+    let catalog_guard = match catalog.read() {
+        Ok(catalog) => Some(catalog),
+        Err(error) => {
+            eprintln!("failed to read app catalog for search: {error}");
+            None
+        }
+    };
     let file_index_guard = match file_index.read() {
         Ok(index) => Some(index),
         Err(error) => {
@@ -1423,8 +1476,11 @@ fn search(
         }
     };
 
+    let empty_catalog = AppCatalog::default();
+    let catalog = catalog_guard.as_deref().unwrap_or(&empty_catalog);
+
     search_all(
-        &catalog,
+        catalog,
         file_index_guard.as_deref(),
         clipboard_settings_guard.as_deref(),
         clipboard_history_guard.as_deref(),
@@ -1449,9 +1505,12 @@ fn set_launcher_expanded(app: tauri::AppHandle, expanded: bool) -> Result<(), St
 #[tauri::command]
 fn launch_app(
     app: tauri::AppHandle,
-    catalog: tauri::State<'_, AppCatalog>,
+    catalog: tauri::State<'_, AppCatalogState>,
     app_id: String,
 ) -> Result<LaunchResult, String> {
+    let catalog = catalog
+        .read()
+        .map_err(|_| "Application catalog unavailable".to_owned())?;
     let result = app_launch::launch_app(&catalog, &app_id)?;
 
     hide_launcher_for_app(&app)?;
@@ -1514,7 +1573,15 @@ pub fn run() {
             let launch_args = setup_launch_args.clone();
             migrate_gnome_hotkey_command_if_needed();
 
-            let app_catalog = AppCatalog::scan();
+            let app_catalog = if foreground_mode {
+                dev_log("foreground mode: app catalog scan deferred");
+                Arc::new(RwLock::new(AppCatalog::default()))
+            } else {
+                let app_catalog = AppCatalog::scan();
+                let app_count = app_catalog.len();
+                dev_log(format!("discovered {app_count} applications"));
+                Arc::new(RwLock::new(app_catalog))
+            };
             dev_log(format!(
                 "defaults: hotkey={}, max_results={}, compact_window={}x{}, expanded_window={}x{}, theme={}, search_source={}",
                 settings::DEFAULT_HOTKEY_LABEL,
@@ -1526,13 +1593,20 @@ pub fn run() {
                 settings::DEFAULT_THEME,
                 settings::DEFAULT_SEARCH_SOURCE
             ));
-            dev_log(format!("discovered {} applications", app_catalog.len()));
-            app.manage(app_catalog);
+            app.manage(app_catalog.clone());
+
+            if foreground_mode {
+                start_app_catalog_scan(app_catalog, Some(app.handle().clone()));
+            }
 
             let search_history = load_search_history_state(app.handle());
             app.manage(search_history);
 
-            let (clipboard_settings, clipboard_history) = load_clipboard_states(app.handle());
+            let (clipboard_settings, clipboard_history) = if foreground_mode {
+                load_foreground_clipboard_states(app.handle())
+            } else {
+                load_clipboard_states(app.handle())
+            };
             app.manage(clipboard_settings);
             app.manage(clipboard_history);
 
@@ -1548,7 +1622,12 @@ pub fn run() {
 
             let file_index = Arc::new(RwLock::new(FileIndex::new()));
             app.manage(file_index.clone());
-            start_file_index_scan(file_index);
+
+            if foreground_mode {
+                dev_log("foreground mode: file index scan skipped");
+            } else {
+                start_file_index_scan(file_index);
+            }
 
             if let Some(window) = app.get_webview_window(LAUNCHER_WINDOW_LABEL) {
                 position_launcher(&window)?;

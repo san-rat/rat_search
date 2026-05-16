@@ -824,7 +824,7 @@
     }
 
     let disposed = false;
-    let unlisten: UnlistenFn | undefined;
+    const unlisteners: UnlistenFn[] = [];
 
     void listen("launcher:shown", () => {
       query = "";
@@ -838,17 +838,34 @@
           return;
         }
 
-        unlisten = unlistenListener;
+        unlisteners.push(unlistenListener);
       })
       .catch((error) => {
         console.error("failed to listen for launcher focus event", error);
+      });
+
+    void listen("launcher:catalog-ready", () => {
+      if (query.trim().length > 0) {
+        void loadResults(query);
+      }
+    })
+      .then((unlistenListener) => {
+        if (disposed) {
+          unlistenListener();
+          return;
+        }
+
+        unlisteners.push(unlistenListener);
+      })
+      .catch((error) => {
+        console.error("failed to listen for launcher catalog event", error);
       });
 
     return () => {
       disposed = true;
       clearCollapseTimer();
       delete ratSearchWindow().__ratSearchFocusInput;
-      unlisten?.();
+      unlisteners.forEach((unlisten) => unlisten());
     };
   });
 

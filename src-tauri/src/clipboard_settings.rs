@@ -68,6 +68,10 @@ impl ClipboardSettings {
         }
     }
 
+    pub(crate) fn disabled(path: PathBuf) -> Self {
+        Self::defaults(path)
+    }
+
     pub(crate) fn save(&self) -> Result<(), String> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|error| {
