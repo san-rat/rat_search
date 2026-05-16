@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Rat Search
+Comment=Start Rat Search in the background
+Exec=rat-search
+Icon=rat-search
+Terminal=false
+X-GNOME-Autostart-enabled=true

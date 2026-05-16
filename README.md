@@ -55,7 +55,8 @@ search history, and opt-in local text clipboard history.
 | `Esc` | Clear or close the launcher |
 
 On Wayland, global shortcut registration is skipped by design. Bind your
-desktop shortcut to `rat-search toggle` for the same launcher workflow.
+desktop shortcut to `rat-search foreground` so GNOME treats the launcher as a
+fresh user-activated window.
 
 ## Local Development
 

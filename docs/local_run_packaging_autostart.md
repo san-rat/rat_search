@@ -17,7 +17,7 @@ Expected behavior:
 - The launcher window starts hidden.
 - `Alt+Space` toggles the launcher on X11.
 - On Wayland, global shortcut registration is skipped; bind your desktop
-  shortcut to `rat-search toggle`.
+  shortcut to `rat-search foreground`.
 - Search results use in-memory app and file/folder catalogs scanned at startup,
   plus lightweight search history and clipboard state loaded from app data.
 - `open <folder>` and `open <code-like-file>` results open in Visual Studio
@@ -82,8 +82,9 @@ Rust, and grant only the required autostart permissions.
 
 Until then, the manual Linux fallback is to install/package Rat Search normally
 and add the installed app to Ubuntu's Startup Applications list. The startup
-entry should launch Rat Search itself, not `rat-search toggle`; the app should
-remain resident with the window hidden after startup.
+entry should launch Rat Search itself, not `rat-search toggle` or
+`rat-search foreground`; the app should remain resident with the window hidden
+after startup.
 
 ## Performance Notes
 

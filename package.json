@@ -1,6 +1,6 @@
 {
   "name": "rat-search",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "A Spotlight-inspired command palette and app launcher for Ubuntu Linux.",
   "type": "module",
   "scripts": {

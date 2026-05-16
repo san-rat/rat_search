@@ -46,5 +46,5 @@ docs to read first.
   and `Pictures`.
 - Search uses in-memory catalogs and lightweight history state so typing does
   not rescan the filesystem.
-- Wayland users should bind their desktop shortcut to `rat-search toggle`
+- Wayland users should bind their desktop shortcut to `rat-search foreground`
   because global shortcut registration is skipped by design.

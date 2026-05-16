@@ -112,6 +112,11 @@
     max_text_bytes: number;
   };
 
+  type RatSearchWindow = Window &
+    typeof globalThis & {
+      __ratSearchFocusInput?: () => void;
+    };
+
   let query = $state("");
   let isExpanded = $state(false);
   let isCollapsing = $state(false);
@@ -133,13 +138,34 @@
   let collapseTimer: ReturnType<typeof setTimeout> | null = null;
 
   const COLLAPSE_TRANSITION_MS = 120;
+  const INPUT_FOCUS_RETRY_MS = [0, 40, 100, 220, 420];
 
   $effect(() => {
     void loadResults(query);
   });
 
+  function isSearchInputFocused() {
+    return typeof document !== "undefined" && document.activeElement === searchInput;
+  }
+
+  function focusSearchInputNow() {
+    searchInput?.focus({ preventScroll: true });
+  }
+
   function focusSearchInput() {
-    requestAnimationFrame(() => searchInput?.focus());
+    for (const delayMs of INPUT_FOCUS_RETRY_MS) {
+      setTimeout(() => {
+        if (!isSearchInputFocused()) {
+          focusSearchInputNow();
+        }
+      }, delayMs);
+    }
+
+    requestAnimationFrame(focusSearchInputNow);
+  }
+
+  function ratSearchWindow() {
+    return window as RatSearchWindow;
   }
 
   function prefersReducedMotion() {
@@ -790,6 +816,7 @@
   }
 
   onMount(() => {
+    ratSearchWindow().__ratSearchFocusInput = focusSearchInput;
     focusSearchInput();
 
     if (!isTauri()) {
@@ -820,6 +847,7 @@
     return () => {
       disposed = true;
       clearCollapseTimer();
+      delete ratSearchWindow().__ratSearchFocusInput;
       unlisten?.();
     };
   });

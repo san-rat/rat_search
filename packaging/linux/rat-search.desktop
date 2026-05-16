@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Rat Search
+Comment=Spotlight-inspired command palette and app launcher for Ubuntu Linux
+Exec=rat-search
+Icon=rat-search
+Terminal=false
+Categories=Utility;
+StartupNotify=true
