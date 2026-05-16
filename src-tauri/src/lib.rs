@@ -1,9 +1,13 @@
 use std::{
+    fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock, RwLock,
+    },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::Serialize;
@@ -20,6 +24,7 @@ mod file_actions;
 mod file_icons;
 mod file_index;
 mod file_search;
+mod ipc;
 mod search_history;
 mod search_result;
 mod settings;
@@ -32,6 +37,7 @@ use clipboard_history::{ClipboardHistory, ClipboardRecordOutcome};
 use clipboard_settings::ClipboardSettings;
 use file_actions::{PreferredOpen, ValidatedPath};
 use file_index::FileIndex;
+use ipc::{IpcRequest, IpcResponse};
 use search_history::SearchHistory;
 use search_result::{SearchAction, SearchResult, SearchSource};
 use settings_search::PreparedSettingCommand;
@@ -39,6 +45,7 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
 
 type FileIndexState = Arc<RwLock<FileIndex>>;
+type AppCatalogState = Arc<RwLock<AppCatalog>>;
 type ClipboardHistoryState = Arc<RwLock<ClipboardHistory>>;
 type ClipboardSettingsState = Arc<RwLock<ClipboardSettings>>;
 type SearchHistoryState = Arc<RwLock<SearchHistory>>;
@@ -54,14 +61,34 @@ struct ClipboardPrivacyStatus {
 
 const LAUNCHER_WINDOW_LABEL: &str = "main";
 const LAUNCHER_SHOWN_EVENT: &str = "launcher:shown";
+const LAUNCHER_CATALOG_READY_EVENT: &str = "launcher:catalog-ready";
 const TOGGLE_ARG: &str = "toggle";
+const FOREGROUND_ARG: &str = "foreground";
 const CLIPBOARD_HISTORY_FILE_NAME: &str = "clipboard-history.json";
 const CLIPBOARD_SETTINGS_FILE_NAME: &str = "clipboard-settings.json";
 const CLIPBOARD_POLL_INTERVAL_MS: u64 = 1_000;
 const SEARCH_HISTORY_FILE_NAME: &str = "search-history.json";
-const DELAYED_CENTER_MS: u64 = 80;
+const LAUNCHER_FOCUS_RETRY_MS: [u64; 4] = [50, 150, 300, 500];
 const LAUNCHER_VERTICAL_PERCENT: u32 = 25;
 const LAUNCHER_SEARCH_ROW_CENTER_OFFSET: i32 = 42;
+const STARTUP_ID_ARG: &str = "--startup-id";
+const XDG_ACTIVATION_TOKEN_ARG: &str = "--xdg-activation-token";
+const LEGACY_GNOME_HOTKEY_COMMAND: &str = "rat-search toggle";
+const GNOME_HOTKEY_COMMAND: &str = r#"/bin/sh -c 'exec rat-search foreground --startup-id "$DESKTOP_STARTUP_ID" --xdg-activation-token "$XDG_ACTIVATION_TOKEN"'"#;
+const GNOME_MEDIA_KEYS_SCHEMA: &str = "org.gnome.settings-daemon.plugins.media-keys";
+const GNOME_CUSTOM_KEYBINDING_SCHEMA: &str =
+    "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding";
+const FOREGROUND_PID_FILE_NAME: &str = "rat-search-foreground.pid";
+
+static FOREGROUND_LAUNCHER_MODE: AtomicBool = AtomicBool::new(false);
+static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LauncherActivation {
+    startup_id: Option<String>,
+    activation_time: Option<u32>,
+    xdg_activation_token: Option<String>,
+}
 
 #[cfg(debug_assertions)]
 fn dev_log(message: impl AsRef<str>) {
@@ -70,6 +97,15 @@ fn dev_log(message: impl AsRef<str>) {
 
 #[cfg(not(debug_assertions))]
 fn dev_log(_message: impl AsRef<str>) {}
+
+fn timing_log(label: &str) {
+    if let Some(start) = PROCESS_START.get() {
+        dev_log(format!(
+            "timing: {label} at {}ms",
+            start.elapsed().as_millis()
+        ));
+    }
+}
 
 #[cfg(target_os = "linux")]
 fn initialize_linux_window_backend() {
@@ -163,7 +199,96 @@ fn set_launcher_size(window: &WebviewWindow, expanded: bool) -> tauri::Result<()
     position_launcher_with_reason(window, if expanded { "expand" } else { "collapse" })
 }
 
-fn focus_launcher(window: &WebviewWindow) {
+#[cfg(target_os = "linux")]
+fn prepare_launcher_activation_native(window: &WebviewWindow, activation: &LauncherActivation) {
+    let Some(startup_id) = activation
+        .startup_id
+        .clone()
+        .or_else(|| activation.xdg_activation_token.clone())
+    else {
+        return;
+    };
+
+    if gtk::glib::MainContext::default().is_owner() {
+        match window.gtk_window() {
+            Ok(gtk_window) => {
+                use gtk::prelude::*;
+
+                gtk_window.set_startup_id(&startup_id);
+            }
+            Err(error) => {
+                eprintln!("failed to access launcher GTK window for startup id: {error}");
+            }
+        }
+        return;
+    }
+
+    let target = window.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+
+    if let Err(error) = window.run_on_main_thread(move || match target.gtk_window() {
+        Ok(gtk_window) => {
+            use gtk::prelude::*;
+
+            gtk_window.set_startup_id(&startup_id);
+            let _ = sender.send(());
+        }
+        Err(error) => {
+            eprintln!("failed to access launcher GTK window for startup id: {error}");
+            let _ = sender.send(());
+        }
+    }) {
+        eprintln!("failed to schedule launcher startup id: {error}");
+        return;
+    }
+
+    if receiver.recv_timeout(Duration::from_millis(100)).is_err() {
+        dev_log("timed out waiting for launcher startup id to apply before show");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn prepare_launcher_activation_native(_window: &WebviewWindow, _activation: &LauncherActivation) {}
+
+#[cfg(target_os = "linux")]
+fn present_launcher_native(window: &WebviewWindow, activation: &LauncherActivation) {
+    let target = window.clone();
+    let activation = activation.clone();
+
+    if let Err(error) = window.run_on_main_thread(move || match target.gtk_window() {
+        Ok(gtk_window) => {
+            use gtk::prelude::*;
+
+            if let Some(startup_id) = activation.startup_id.as_deref() {
+                gtk_window.set_startup_id(startup_id);
+            } else if let Some(xdg_activation_token) = activation.xdg_activation_token.as_deref() {
+                gtk_window.set_startup_id(xdg_activation_token);
+            }
+
+            gtk_window.set_accept_focus(true);
+            gtk_window.set_focus_on_map(true);
+            gtk_window.set_keep_above(true);
+            gtk_window.present_with_time(
+                activation
+                    .activation_time
+                    .unwrap_or_else(gtk::current_event_time),
+            );
+            gtk_window.grab_focus();
+        }
+        Err(error) => {
+            eprintln!("failed to access launcher GTK window for focus: {error}");
+        }
+    }) {
+        eprintln!("failed to schedule launcher GTK focus: {error}");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn present_launcher_native(_window: &WebviewWindow, _activation: &LauncherActivation) {}
+
+fn focus_launcher(window: &WebviewWindow, activation: &LauncherActivation) {
+    present_launcher_native(window, activation);
+
     if let Err(error) = window.set_focus() {
         eprintln!("failed to focus launcher window: {error}");
     }
@@ -171,28 +296,39 @@ fn focus_launcher(window: &WebviewWindow) {
     if let Err(error) = window.emit(LAUNCHER_SHOWN_EVENT, ()) {
         eprintln!("failed to emit {LAUNCHER_SHOWN_EVENT}: {error}");
     }
+
+    if let Err(error) = window.eval("window.__ratSearchFocusInput?.()") {
+        eprintln!("failed to evaluate launcher input focus helper: {error}");
+    }
 }
 
-fn show_launcher(window: &WebviewWindow) -> tauri::Result<()> {
+fn show_launcher(window: &WebviewWindow, activation: LauncherActivation) -> tauri::Result<()> {
+    window.set_focusable(true)?;
+    window.unminimize()?;
     set_launcher_size(window, false)?;
     position_launcher_with_reason(window, "before show")?;
+    prepare_launcher_activation_native(window, &activation);
     window.show()?;
     position_launcher_with_reason(window, "after show")?;
+    focus_launcher(window, &activation);
 
     let delayed_window = window.clone();
     thread::spawn(move || {
-        thread::sleep(Duration::from_millis(DELAYED_CENTER_MS));
+        for delay_ms in LAUNCHER_FOCUS_RETRY_MS {
+            thread::sleep(Duration::from_millis(delay_ms));
 
-        if !matches!(delayed_window.is_visible(), Ok(true)) {
-            dev_log("delayed after show: launcher is no longer visible; skipping center/focus");
-            return;
+            if !matches!(delayed_window.is_visible(), Ok(true)) {
+                dev_log("delayed after show: launcher is no longer visible; skipping center/focus");
+                return;
+            }
+
+            if let Err(error) = position_launcher_with_reason(&delayed_window, "delayed after show")
+            {
+                eprintln!("failed to position launcher window after show: {error}");
+            }
+
+            focus_launcher(&delayed_window, &activation);
         }
-
-        if let Err(error) = position_launcher_with_reason(&delayed_window, "delayed after show") {
-            eprintln!("failed to position launcher window after show: {error}");
-        }
-
-        focus_launcher(&delayed_window);
     });
 
     Ok(())
@@ -207,10 +343,17 @@ fn hide_launcher_for_app(app: &tauri::AppHandle) -> Result<(), String> {
         return Ok(());
     };
 
-    hide_launcher_window(&window).map_err(|error| error.to_string())
+    hide_launcher_window(&window).map_err(|error| error.to_string())?;
+
+    if FOREGROUND_LAUNCHER_MODE.load(Ordering::Relaxed) {
+        remove_foreground_pid_file();
+        app.exit(0);
+    }
+
+    Ok(())
 }
 
-fn toggle_launcher(app: &tauri::AppHandle) {
+fn toggle_launcher(app: &tauri::AppHandle, activation: LauncherActivation) {
     let Some(window) = app.get_webview_window(LAUNCHER_WINDOW_LABEL) else {
         eprintln!("launcher window '{LAUNCHER_WINDOW_LABEL}' was not found");
         return;
@@ -223,7 +366,7 @@ fn toggle_launcher(app: &tauri::AppHandle) {
             }
         }
         Ok(false) => {
-            if let Err(error) = show_launcher(&window) {
+            if let Err(error) = show_launcher(&window, activation) {
                 eprintln!("failed to show launcher window: {error}");
             }
         }
@@ -235,9 +378,124 @@ fn should_toggle_from_args(args: &[String]) -> bool {
     args.iter().any(|arg| arg == TOGGLE_ARG)
 }
 
+fn should_launch_foreground_from_args(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == FOREGROUND_ARG)
+}
+
+fn should_show_launcher_from_args(args: &[String]) -> bool {
+    should_toggle_from_args(args) || should_launch_foreground_from_args(args)
+}
+
+fn foreground_pid_file_path() -> PathBuf {
+    std::env::temp_dir().join(FOREGROUND_PID_FILE_NAME)
+}
+
+fn parse_pid(pid: &str) -> Option<u32> {
+    pid.trim().parse::<u32>().ok().filter(|pid| *pid > 0)
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_alive(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_is_alive(_pid: u32) -> bool {
+    false
+}
+
+fn terminate_process(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn remove_foreground_pid_file() {
+    let _ = fs::remove_file(foreground_pid_file_path());
+}
+
+fn consume_foreground_toggle_request(args: &[String]) -> bool {
+    if !should_launch_foreground_from_args(args) {
+        return false;
+    }
+
+    let pid_file = foreground_pid_file_path();
+
+    if let Ok(pid) = fs::read_to_string(&pid_file) {
+        if let Some(pid) = parse_pid(&pid) {
+            if pid != std::process::id() && process_is_alive(pid) {
+                if terminate_process(pid) {
+                    remove_foreground_pid_file();
+                    return true;
+                }
+            }
+        }
+    }
+
+    if let Err(error) = fs::write(&pid_file, std::process::id().to_string()) {
+        eprintln!("failed to write foreground launcher pid file: {error}");
+    }
+
+    false
+}
+
+fn activation_time_from_startup_id(startup_id: &str) -> Option<u32> {
+    let time_start = startup_id.rfind("_TIME")? + "_TIME".len();
+    let timestamp = startup_id[time_start..]
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>();
+
+    if timestamp.is_empty() {
+        return None;
+    }
+
+    timestamp.parse::<u32>().ok()
+}
+
+fn activation_time_from_args(args: &[String]) -> Option<u32> {
+    args.windows(2).find_map(|arg_pair| {
+        if arg_pair[0] == STARTUP_ID_ARG {
+            activation_time_from_startup_id(&arg_pair[1])
+        } else {
+            None
+        }
+    })
+}
+
+fn launcher_activation_from_args(args: &[String]) -> LauncherActivation {
+    let startup_id = args.windows(2).find_map(|arg_pair| {
+        if arg_pair[0] == STARTUP_ID_ARG && !arg_pair[1].trim().is_empty() {
+            Some(arg_pair[1].clone())
+        } else {
+            None
+        }
+    });
+    let xdg_activation_token = args.windows(2).find_map(|arg_pair| {
+        if arg_pair[0] == XDG_ACTIVATION_TOKEN_ARG && !arg_pair[1].trim().is_empty() {
+            Some(arg_pair[1].clone())
+        } else {
+            None
+        }
+    });
+    let activation_time = startup_id
+        .as_deref()
+        .and_then(activation_time_from_startup_id)
+        .or_else(|| activation_time_from_args(args));
+
+    LauncherActivation {
+        startup_id,
+        activation_time,
+        xdg_activation_token,
+    }
+}
+
 fn handle_cli_args(app: &tauri::AppHandle, args: &[String]) {
     if should_toggle_from_args(args) {
-        toggle_launcher(app);
+        toggle_launcher(app, launcher_activation_from_args(args));
     }
 }
 
@@ -247,13 +505,155 @@ fn is_wayland_session() -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(target_os = "linux")]
+fn is_gnome_desktop() -> bool {
+    std::env::var("XDG_CURRENT_DESKTOP")
+        .map(|desktop| desktop.to_ascii_uppercase().contains("GNOME"))
+        .unwrap_or(false)
+}
+
+fn parse_gsettings_path_array(output: &str) -> Vec<String> {
+    output
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(',')
+        .filter_map(|path| {
+            let path = path.trim().trim_matches('\'').trim_matches('"').trim();
+            (!path.is_empty() && path != "@as").then(|| path.to_owned())
+        })
+        .collect()
+}
+
+fn unquote_gsettings_string(output: &str) -> String {
+    output
+        .trim()
+        .trim_matches('\'')
+        .trim_matches('"')
+        .to_owned()
+}
+
+fn quote_gsettings_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn is_legacy_rat_search_hotkey_command(command: &str) -> bool {
+    let command = command.trim();
+    command == LEGACY_GNOME_HOTKEY_COMMAND
+        || (command.contains(LEGACY_GNOME_HOTKEY_COMMAND)
+            && !is_current_rat_search_hotkey_command(command))
+}
+
+fn is_current_rat_search_hotkey_command(command: &str) -> bool {
+    command.trim() == GNOME_HOTKEY_COMMAND
+}
+
+fn is_rat_search_hotkey_binding(name: &str, command: &str) -> bool {
+    name.trim() == "Rat Search"
+        || name.trim() == LEGACY_GNOME_HOTKEY_COMMAND
+        || command.contains(LEGACY_GNOME_HOTKEY_COMMAND)
+        || command.contains("rat-search foreground")
+}
+
+#[cfg(target_os = "linux")]
+fn gsettings_get(schema: &str, key: &str) -> Result<String, String> {
+    Command::new("gsettings")
+        .args(["get", schema, key])
+        .output()
+        .map_err(|error| error.to_string())
+        .and_then(|output| {
+            if output.status.success() {
+                Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+            } else {
+                Err(String::from_utf8_lossy(&output.stderr).into_owned())
+            }
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn gsettings_get_custom(path: &str, key: &str) -> Result<String, String> {
+    let schema = format!("{GNOME_CUSTOM_KEYBINDING_SCHEMA}:{path}");
+
+    gsettings_get(&schema, key)
+}
+
+#[cfg(target_os = "linux")]
+fn gsettings_set_custom(path: &str, key: &str, value: &str) -> Result<(), String> {
+    let schema = format!("{GNOME_CUSTOM_KEYBINDING_SCHEMA}:{path}");
+    let output = Command::new("gsettings")
+        .args(["set", &schema, key, value])
+        .output()
+        .map_err(|error| error.to_string())?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).into_owned())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn migrate_gnome_hotkey_command_if_needed() {
+    if !is_wayland_session() || !is_gnome_desktop() {
+        dev_log("GNOME hotkey migration skipped outside GNOME Wayland");
+        return;
+    }
+
+    let paths = match gsettings_get(GNOME_MEDIA_KEYS_SCHEMA, "custom-keybindings") {
+        Ok(output) => parse_gsettings_path_array(&output),
+        Err(error) => {
+            eprintln!("failed to read GNOME custom keybindings: {error}");
+            return;
+        }
+    };
+
+    for path in paths {
+        let name = gsettings_get_custom(&path, "name")
+            .map(|output| unquote_gsettings_string(&output))
+            .unwrap_or_default();
+        let command = gsettings_get_custom(&path, "command")
+            .map(|output| unquote_gsettings_string(&output))
+            .unwrap_or_default();
+
+        if !is_rat_search_hotkey_binding(&name, &command) {
+            continue;
+        }
+
+        if is_current_rat_search_hotkey_command(&command) {
+            dev_log(format!(
+                "GNOME hotkey migration skipped; {path} already uses startup activation"
+            ));
+            return;
+        }
+
+        if is_legacy_rat_search_hotkey_command(&command) {
+            match gsettings_set_custom(
+                &path,
+                "command",
+                &quote_gsettings_string(GNOME_HOTKEY_COMMAND),
+            ) {
+                Ok(()) => dev_log(format!(
+                    "migrated GNOME hotkey {path} to startup activation command"
+                )),
+                Err(error) => eprintln!("failed to migrate GNOME hotkey {path}: {error}"),
+            }
+            return;
+        }
+    }
+
+    dev_log("GNOME hotkey migration skipped; no Rat Search binding found");
+}
+
+#[cfg(not(target_os = "linux"))]
+fn migrate_gnome_hotkey_command_if_needed() {}
+
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn register_launcher_shortcut(app: &tauri::App) {
     use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
     if cfg!(target_os = "linux") && is_wayland_session() {
         eprintln!(
-            "global shortcut registration skipped on Wayland; bind your desktop shortcut to `rat-search toggle`"
+            "global shortcut registration skipped on Wayland; bind your desktop shortcut to `{GNOME_HOTKEY_COMMAND}`"
         );
         return;
     }
@@ -266,7 +666,7 @@ fn register_launcher_shortcut(app: &tauri::App) {
     let plugin = tauri_plugin_global_shortcut::Builder::new()
         .with_handler(move |app, shortcut, event| {
             if shortcut == &handler_shortcut && event.state() == ShortcutState::Pressed {
-                toggle_launcher(app);
+                toggle_launcher(app, LauncherActivation::default());
             }
         })
         .build();
@@ -287,6 +687,11 @@ fn register_launcher_shortcut(app: &tauri::App) {
 #[tauri::command]
 fn close_launcher(app: tauri::AppHandle) -> Result<(), String> {
     hide_launcher_for_app(&app)
+}
+
+#[tauri::command]
+fn frontend_ready() {
+    timing_log("frontend ready");
 }
 
 #[tauri::command]
@@ -424,6 +829,26 @@ fn load_clipboard_states(
     });
 
     load_clipboard_states_from_paths(settings_path, history_path, current_time_ms())
+}
+
+fn load_foreground_clipboard_states(
+    app: &tauri::AppHandle,
+) -> (ClipboardSettingsState, ClipboardHistoryState) {
+    let settings_path = clipboard_settings_path(app).unwrap_or_else(|error| {
+        eprintln!("failed to resolve clipboard settings path: {error}");
+        fallback_clipboard_settings_path()
+    });
+    let history_path = clipboard_history_path(app).unwrap_or_else(|error| {
+        eprintln!("failed to resolve clipboard history path: {error}");
+        fallback_clipboard_history_path()
+    });
+
+    dev_log("foreground mode: clipboard history load skipped");
+
+    (
+        Arc::new(RwLock::new(ClipboardSettings::disabled(settings_path))),
+        Arc::new(RwLock::new(ClipboardHistory::empty(history_path))),
+    )
 }
 
 fn load_clipboard_states_from_paths(
@@ -667,13 +1092,20 @@ fn spawn_setting_command(command: &PreparedSettingCommand) -> Result<(), String>
         })
 }
 
-#[tauri::command]
-fn open_path(
-    app: tauri::AppHandle,
-    file_index: tauri::State<'_, FileIndexState>,
-    path: String,
+fn launch_app_action(catalog: &AppCatalogState, app_id: &str) -> Result<LaunchResult, String> {
+    let catalog = catalog
+        .read()
+        .map_err(|_| "Application catalog unavailable".to_owned())?;
+
+    app_launch::launch_app(&catalog, app_id)
+}
+
+fn open_path_action(
+    app: &tauri::AppHandle,
+    file_index: &FileIndexState,
+    path: &str,
 ) -> Result<(), String> {
-    let validated_path = validate_file_action_path(&file_index, &path)?;
+    let validated_path = validate_file_action_path(file_index, path)?;
 
     app.opener()
         .open_path(path_for_opener(&validated_path.path), None::<&str>)
@@ -683,24 +1115,21 @@ fn open_path(
                 validated_path.path.display()
             );
             "Could not open item".to_owned()
-        })?;
-
-    hide_launcher_for_app(&app)
+        })
 }
 
-#[tauri::command]
-fn open_in_code(
-    app: tauri::AppHandle,
-    file_index: tauri::State<'_, FileIndexState>,
-    path: String,
+fn open_in_code_action(
+    app: &tauri::AppHandle,
+    file_index: &FileIndexState,
+    path: &str,
 ) -> Result<(), String> {
-    let validated_path = validate_file_action_path(&file_index, &path)?;
+    let validated_path = validate_file_action_path(file_index, path)?;
     let preferred_open = file_actions::prepare_open_in_code(&validated_path);
 
     match preferred_open {
         PreferredOpen::Code(command) => {
             if spawn_prepared_command(&command).is_ok() {
-                return hide_launcher_for_app(&app);
+                return Ok(());
             }
         }
         PreferredOpen::System => {}
@@ -714,18 +1143,15 @@ fn open_in_code(
                 validated_path.path.display()
             );
             "Could not open item".to_owned()
-        })?;
-
-    hide_launcher_for_app(&app)
+        })
 }
 
-#[tauri::command]
-fn reveal_path(
-    app: tauri::AppHandle,
-    file_index: tauri::State<'_, FileIndexState>,
-    path: String,
+fn reveal_path_action(
+    app: &tauri::AppHandle,
+    file_index: &FileIndexState,
+    path: &str,
 ) -> Result<(), String> {
-    let validated_path = validate_file_action_path(&file_index, &path)?;
+    let validated_path = validate_file_action_path(file_index, path)?;
     let reveal_target = file_actions::reveal_target(&validated_path)?;
 
     app.opener()
@@ -736,18 +1162,15 @@ fn reveal_path(
                 reveal_target.display()
             );
             "Could not open item".to_owned()
-        })?;
-
-    hide_launcher_for_app(&app)
+        })
 }
 
-#[tauri::command]
-fn copy_path(
-    app: tauri::AppHandle,
-    file_index: tauri::State<'_, FileIndexState>,
-    path: String,
+fn copy_path_action(
+    app: &tauri::AppHandle,
+    file_index: &FileIndexState,
+    path: &str,
 ) -> Result<(), String> {
-    let validated_path = validate_file_action_path(&file_index, &path)?;
+    let validated_path = validate_file_action_path(file_index, path)?;
 
     app.clipboard()
         .write_text(path_for_opener(&validated_path.path))
@@ -757,22 +1180,168 @@ fn copy_path(
                 validated_path.path.display()
             );
             "Could not complete action".to_owned()
-        })?;
-
-    hide_launcher_for_app(&app)
+        })
 }
 
-#[tauri::command]
-fn copy_text(app: tauri::AppHandle, text: String) -> Result<(), String> {
-    let text = validate_copy_text(&text)?;
+fn copy_text_action(app: &tauri::AppHandle, text: &str) -> Result<(), String> {
+    let text = validate_copy_text(text)?;
 
     app.clipboard()
         .write_text(text.to_owned())
         .map_err(|error| {
             eprintln!("failed to copy text: {error}");
             "Could not complete action".to_owned()
-        })?;
+        })
+}
 
+fn open_calculator_app_action(
+    app: &tauri::AppHandle,
+    expression: &str,
+    result: &str,
+    copy_text: &str,
+) -> Result<(), String> {
+    let command = calculator::prepare_calculator_app_command(expression, result, copy_text)?;
+
+    spawn_calculator_command(&command)?;
+
+    if command.copy_fallback {
+        app.clipboard()
+            .write_text(copy_text.to_owned())
+            .map_err(|error| {
+                eprintln!("failed to copy calculator fallback text: {error}");
+                "Could not open calculator".to_owned()
+            })?;
+    }
+
+    Ok(())
+}
+
+fn open_url_action(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
+    if !web_shortcuts::is_allowed_url(url) {
+        return Err("Could not open item".to_owned());
+    }
+
+    app.opener()
+        .open_url(url.to_owned(), None::<&str>)
+        .map_err(|error| {
+            eprintln!("failed to open url: {error}");
+            "Could not open item".to_owned()
+        })
+}
+
+fn open_setting_action(setting_id: &str) -> Result<(), String> {
+    let command = prepare_setting_command(setting_id)?;
+
+    spawn_setting_command(&command)
+}
+
+fn copy_clipboard_item_action(
+    app: &tauri::AppHandle,
+    history: &ClipboardHistoryState,
+    item_id: &str,
+) -> Result<(), String> {
+    let text = clipboard_item_text_from_state(history, item_id)?;
+
+    app.clipboard().write_text(text).map_err(|error| {
+        eprintln!("failed to copy clipboard history item: {error}");
+        "Could not complete action".to_owned()
+    })?;
+
+    mark_clipboard_item_copied_in_state(history, item_id, current_time_ms())
+}
+
+fn foreground_ipc_request(request: IpcRequest) -> Result<IpcResponse, String> {
+    if !FOREGROUND_LAUNCHER_MODE.load(Ordering::Relaxed) {
+        return Err("not in foreground mode".to_owned());
+    }
+
+    ipc::send_request(&request)
+}
+
+fn foreground_ipc_unit(app: &tauri::AppHandle, request: IpcRequest) -> Option<Result<(), String>> {
+    match foreground_ipc_request(request) {
+        Ok(IpcResponse::Unit) => Some(hide_launcher_for_app(app)),
+        Ok(IpcResponse::Error { message }) => Some(Err(message)),
+        Ok(_) => Some(Err("Unexpected resident response".to_owned())),
+        Err(error) => {
+            dev_log(format!(
+                "foreground IPC unavailable; using local fallback: {error}"
+            ));
+            None
+        }
+    }
+}
+
+fn resident_ipc_ready() -> bool {
+    matches!(
+        ipc::send_request(&IpcRequest::Health),
+        Ok(IpcResponse::Health { ready: true })
+    )
+}
+
+#[tauri::command]
+fn open_path(
+    app: tauri::AppHandle,
+    file_index: tauri::State<'_, FileIndexState>,
+    path: String,
+) -> Result<(), String> {
+    if let Some(result) = foreground_ipc_unit(&app, IpcRequest::OpenPath { path: path.clone() }) {
+        return result;
+    }
+
+    open_path_action(&app, &file_index, &path)?;
+    hide_launcher_for_app(&app)
+}
+
+#[tauri::command]
+fn open_in_code(
+    app: tauri::AppHandle,
+    file_index: tauri::State<'_, FileIndexState>,
+    path: String,
+) -> Result<(), String> {
+    if let Some(result) = foreground_ipc_unit(&app, IpcRequest::OpenInCode { path: path.clone() }) {
+        return result;
+    }
+
+    open_in_code_action(&app, &file_index, &path)?;
+    hide_launcher_for_app(&app)
+}
+
+#[tauri::command]
+fn reveal_path(
+    app: tauri::AppHandle,
+    file_index: tauri::State<'_, FileIndexState>,
+    path: String,
+) -> Result<(), String> {
+    if let Some(result) = foreground_ipc_unit(&app, IpcRequest::RevealPath { path: path.clone() }) {
+        return result;
+    }
+
+    reveal_path_action(&app, &file_index, &path)?;
+    hide_launcher_for_app(&app)
+}
+
+#[tauri::command]
+fn copy_path(
+    app: tauri::AppHandle,
+    file_index: tauri::State<'_, FileIndexState>,
+    path: String,
+) -> Result<(), String> {
+    if let Some(result) = foreground_ipc_unit(&app, IpcRequest::CopyPath { path: path.clone() }) {
+        return result;
+    }
+
+    copy_path_action(&app, &file_index, &path)?;
+    hide_launcher_for_app(&app)
+}
+
+#[tauri::command]
+fn copy_text(app: tauri::AppHandle, text: String) -> Result<(), String> {
+    if let Some(result) = foreground_ipc_unit(&app, IpcRequest::CopyText { text: text.clone() }) {
+        return result;
+    }
+
+    copy_text_action(&app, &text)?;
     hide_launcher_for_app(&app)
 }
 
@@ -783,17 +1352,18 @@ fn open_calculator_app(
     result: String,
     copy_text: String,
 ) -> Result<(), String> {
-    let command = calculator::prepare_calculator_app_command(&expression, &result, &copy_text)?;
-
-    spawn_calculator_command(&command)?;
-
-    if command.copy_fallback {
-        app.clipboard().write_text(copy_text).map_err(|error| {
-            eprintln!("failed to copy calculator fallback text: {error}");
-            "Could not open calculator".to_owned()
-        })?;
+    if let Some(result) = foreground_ipc_unit(
+        &app,
+        IpcRequest::OpenCalculatorApp {
+            expression: expression.clone(),
+            result: result.clone(),
+            copy_text: copy_text.clone(),
+        },
+    ) {
+        return result;
     }
 
+    open_calculator_app_action(&app, &expression, &result, &copy_text)?;
     hide_launcher_for_app(&app)
 }
 
@@ -821,6 +1391,19 @@ fn delete_clipboard_item(
     history: tauri::State<'_, ClipboardHistoryState>,
     item_id: String,
 ) -> Result<(), String> {
+    if FOREGROUND_LAUNCHER_MODE.load(Ordering::Relaxed) {
+        match foreground_ipc_request(IpcRequest::DeleteClipboardItem {
+            item_id: item_id.clone(),
+        }) {
+            Ok(IpcResponse::Unit) => return Ok(()),
+            Ok(IpcResponse::Error { message }) => return Err(message),
+            Ok(_) => return Err("Unexpected resident response".to_owned()),
+            Err(error) => dev_log(format!(
+                "foreground IPC unavailable; using local clipboard fallback: {error}"
+            )),
+        }
+    }
+
     delete_clipboard_item_in_state(&history, &item_id)
 }
 
@@ -830,14 +1413,16 @@ fn copy_clipboard_item(
     history: tauri::State<'_, ClipboardHistoryState>,
     item_id: String,
 ) -> Result<(), String> {
-    let text = clipboard_item_text_from_state(&history, &item_id)?;
+    if let Some(result) = foreground_ipc_unit(
+        &app,
+        IpcRequest::CopyClipboardItem {
+            item_id: item_id.clone(),
+        },
+    ) {
+        return result;
+    }
 
-    app.clipboard().write_text(text).map_err(|error| {
-        eprintln!("failed to copy clipboard history item: {error}");
-        "Could not complete action".to_owned()
-    })?;
-
-    mark_clipboard_item_copied_in_state(&history, &item_id, current_time_ms())?;
+    copy_clipboard_item_action(&app, &history, &item_id)?;
     hide_launcher_for_app(&app)
 }
 
@@ -851,24 +1436,26 @@ fn get_clipboard_privacy_status(
 
 #[tauri::command]
 fn open_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
-    if !web_shortcuts::is_allowed_url(&url) {
-        return Err("Could not open item".to_owned());
+    if let Some(result) = foreground_ipc_unit(&app, IpcRequest::OpenUrl { url: url.clone() }) {
+        return result;
     }
 
-    app.opener().open_url(url, None::<&str>).map_err(|error| {
-        eprintln!("failed to open url: {error}");
-        "Could not open item".to_owned()
-    })?;
-
+    open_url_action(&app, &url)?;
     hide_launcher_for_app(&app)
 }
 
 #[tauri::command]
 fn open_setting(app: tauri::AppHandle, setting_id: String) -> Result<(), String> {
-    let command = prepare_setting_command(&setting_id)?;
+    if let Some(result) = foreground_ipc_unit(
+        &app,
+        IpcRequest::OpenSetting {
+            setting_id: setting_id.clone(),
+        },
+    ) {
+        return result;
+    }
 
-    spawn_setting_command(&command)?;
-
+    open_setting_action(&setting_id)?;
     hide_launcher_for_app(&app)
 }
 
@@ -877,7 +1464,44 @@ fn record_search_history(
     history: tauri::State<'_, SearchHistoryState>,
     query: String,
 ) -> Result<(), String> {
+    if FOREGROUND_LAUNCHER_MODE.load(Ordering::Relaxed) {
+        match foreground_ipc_request(IpcRequest::RecordSearchHistory {
+            query: query.clone(),
+        }) {
+            Ok(IpcResponse::Unit) => return Ok(()),
+            Ok(IpcResponse::Error { message }) => return Err(message),
+            Ok(_) => return Err("Unexpected resident response".to_owned()),
+            Err(error) => dev_log(format!(
+                "foreground IPC unavailable; using local history fallback: {error}"
+            )),
+        }
+    }
+
     record_search_history_in_state(&history, &query, current_time_ms())
+}
+
+fn start_app_catalog_scan(app_catalog: AppCatalogState, app_handle: Option<tauri::AppHandle>) {
+    thread::spawn(move || {
+        let scanned_catalog = AppCatalog::scan();
+        let scanned_count = scanned_catalog.len();
+
+        match app_catalog.write() {
+            Ok(mut catalog) => {
+                *catalog = scanned_catalog;
+                dev_log(format!(
+                    "app catalog scan: stored {scanned_count} application records"
+                ));
+                if let Some(app_handle) = app_handle {
+                    if let Err(error) = app_handle.emit(LAUNCHER_CATALOG_READY_EVENT, ()) {
+                        eprintln!("failed to emit {LAUNCHER_CATALOG_READY_EVENT}: {error}");
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("failed to store app catalog scan results: {error}");
+            }
+        }
+    });
 }
 
 fn start_file_index_scan(file_index: FileIndexState) {
@@ -903,6 +1527,107 @@ fn start_file_index_scan(file_index: FileIndexState) {
             }
         }
     });
+}
+
+fn start_resident_ipc_server(
+    app: tauri::AppHandle,
+    catalog: AppCatalogState,
+    file_index: FileIndexState,
+    clipboard_settings: ClipboardSettingsState,
+    clipboard_history: ClipboardHistoryState,
+    search_history: SearchHistoryState,
+) {
+    match ipc::start_server(move |request| {
+        handle_resident_ipc_request(
+            &app,
+            &catalog,
+            &file_index,
+            &clipboard_settings,
+            &clipboard_history,
+            &search_history,
+            request,
+        )
+    }) {
+        Ok(path) => dev_log(format!("resident IPC listening at {}", path.display())),
+        Err(error) => eprintln!("failed to start resident IPC server: {error}"),
+    }
+}
+
+fn handle_resident_ipc_request(
+    app: &tauri::AppHandle,
+    catalog: &AppCatalogState,
+    file_index: &FileIndexState,
+    clipboard_settings: &ClipboardSettingsState,
+    clipboard_history: &ClipboardHistoryState,
+    search_history: &SearchHistoryState,
+    request: IpcRequest,
+) -> IpcResponse {
+    match request {
+        IpcRequest::Health => IpcResponse::Health { ready: true },
+        IpcRequest::Search { query, limit } => {
+            let catalog_guard = catalog.read().ok();
+            let file_index_guard = file_index.read().ok();
+            let clipboard_settings_guard = clipboard_settings.read().ok();
+            let clipboard_history_guard = clipboard_history.read().ok();
+            let search_history_guard = search_history.read().ok();
+            let empty_catalog = AppCatalog::default();
+            let catalog = catalog_guard.as_deref().unwrap_or(&empty_catalog);
+            let results = search_all(
+                catalog,
+                file_index_guard.as_deref(),
+                clipboard_settings_guard.as_deref(),
+                clipboard_history_guard.as_deref(),
+                search_history_guard.as_deref(),
+                &query,
+                limit,
+            );
+
+            IpcResponse::Search { results }
+        }
+        IpcRequest::RecordSearchHistory { query } => unit_response(record_search_history_in_state(
+            search_history,
+            &query,
+            current_time_ms(),
+        )),
+        IpcRequest::LaunchApp { app_id } => match launch_app_action(catalog, &app_id) {
+            Ok(result) => IpcResponse::LaunchApp { result },
+            Err(message) => IpcResponse::Error { message },
+        },
+        IpcRequest::OpenPath { path } => unit_response(open_path_action(app, file_index, &path)),
+        IpcRequest::OpenInCode { path } => {
+            unit_response(open_in_code_action(app, file_index, &path))
+        }
+        IpcRequest::RevealPath { path } => {
+            unit_response(reveal_path_action(app, file_index, &path))
+        }
+        IpcRequest::CopyPath { path } => unit_response(copy_path_action(app, file_index, &path)),
+        IpcRequest::CopyText { text } => unit_response(copy_text_action(app, &text)),
+        IpcRequest::OpenCalculatorApp {
+            expression,
+            result,
+            copy_text,
+        } => unit_response(open_calculator_app_action(
+            app,
+            &expression,
+            &result,
+            &copy_text,
+        )),
+        IpcRequest::OpenUrl { url } => unit_response(open_url_action(app, &url)),
+        IpcRequest::OpenSetting { setting_id } => unit_response(open_setting_action(&setting_id)),
+        IpcRequest::CopyClipboardItem { item_id } => {
+            unit_response(copy_clipboard_item_action(app, clipboard_history, &item_id))
+        }
+        IpcRequest::DeleteClipboardItem { item_id } => {
+            unit_response(delete_clipboard_item_in_state(clipboard_history, &item_id))
+        }
+    }
+}
+
+fn unit_response(result: Result<(), String>) -> IpcResponse {
+    match result {
+        Ok(()) => IpcResponse::Unit,
+        Err(message) => IpcResponse::Error { message },
+    }
 }
 
 fn search_all(
@@ -1000,7 +1725,7 @@ fn normalize_search_text(value: &str) -> String {
 
 #[tauri::command]
 fn search(
-    catalog: tauri::State<'_, AppCatalog>,
+    catalog: tauri::State<'_, AppCatalogState>,
     file_index: tauri::State<'_, FileIndexState>,
     clipboard_settings: tauri::State<'_, ClipboardSettingsState>,
     clipboard_history: tauri::State<'_, ClipboardHistoryState>,
@@ -1008,6 +1733,37 @@ fn search(
     query: String,
     limit: usize,
 ) -> Vec<SearchResult> {
+    timing_log("first search request");
+    if FOREGROUND_LAUNCHER_MODE.load(Ordering::Relaxed) {
+        match foreground_ipc_request(IpcRequest::Search {
+            query: query.clone(),
+            limit,
+        }) {
+            Ok(IpcResponse::Search { results }) => {
+                timing_log("resident search response");
+                return results;
+            }
+            Ok(IpcResponse::Error { message }) => {
+                eprintln!("resident search failed: {message}");
+                return Vec::new();
+            }
+            Ok(_) => {
+                eprintln!("resident search returned unexpected response");
+                return Vec::new();
+            }
+            Err(error) => dev_log(format!(
+                "foreground IPC unavailable; using local search fallback: {error}"
+            )),
+        }
+    }
+
+    let catalog_guard = match catalog.read() {
+        Ok(catalog) => Some(catalog),
+        Err(error) => {
+            eprintln!("failed to read app catalog for search: {error}");
+            None
+        }
+    };
     let file_index_guard = match file_index.read() {
         Ok(index) => Some(index),
         Err(error) => {
@@ -1037,8 +1793,11 @@ fn search(
         }
     };
 
+    let empty_catalog = AppCatalog::default();
+    let catalog = catalog_guard.as_deref().unwrap_or(&empty_catalog);
+
     search_all(
-        &catalog,
+        catalog,
         file_index_guard.as_deref(),
         clipboard_settings_guard.as_deref(),
         clipboard_history_guard.as_deref(),
@@ -1063,11 +1822,26 @@ fn set_launcher_expanded(app: tauri::AppHandle, expanded: bool) -> Result<(), St
 #[tauri::command]
 fn launch_app(
     app: tauri::AppHandle,
-    catalog: tauri::State<'_, AppCatalog>,
+    catalog: tauri::State<'_, AppCatalogState>,
     app_id: String,
 ) -> Result<LaunchResult, String> {
-    let result = app_launch::launch_app(&catalog, &app_id)?;
+    if FOREGROUND_LAUNCHER_MODE.load(Ordering::Relaxed) {
+        match foreground_ipc_request(IpcRequest::LaunchApp {
+            app_id: app_id.clone(),
+        }) {
+            Ok(IpcResponse::LaunchApp { result }) => {
+                hide_launcher_for_app(&app)?;
+                return Ok(result);
+            }
+            Ok(IpcResponse::Error { message }) => return Err(message),
+            Ok(_) => return Err("Unexpected resident response".to_owned()),
+            Err(error) => dev_log(format!(
+                "foreground IPC unavailable; using local app launch fallback: {error}"
+            )),
+        }
+    }
 
+    let result = launch_app_action(&catalog, &app_id)?;
     hide_launcher_for_app(&app)?;
 
     Ok(result)
@@ -1075,16 +1849,31 @@ fn launch_app(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let _ = PROCESS_START.set(Instant::now());
+    timing_log("process start");
     initialize_linux_window_backend();
+
+    let launch_args = std::env::args().collect::<Vec<_>>();
+    let foreground_mode = should_launch_foreground_from_args(&launch_args);
+
+    if consume_foreground_toggle_request(&launch_args) {
+        return;
+    }
+
+    FOREGROUND_LAUNCHER_MODE.store(foreground_mode, Ordering::Relaxed);
 
     let mut builder = tauri::Builder::default();
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     {
-        builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
-            handle_cli_args(app, &args);
-        }));
+        if !foreground_mode {
+            builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+                handle_cli_args(app, &args);
+            }));
+        }
     }
+
+    let setup_launch_args = launch_args.clone();
 
     builder
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -1098,6 +1887,7 @@ pub fn run() {
             delete_clipboard_item,
             disable_clipboard_history,
             enable_clipboard_history,
+            frontend_ready,
             get_clipboard_privacy_status,
             hide_launcher,
             launch_app,
@@ -1111,9 +1901,25 @@ pub fn run() {
             search,
             set_launcher_expanded
         ])
-        .setup(|app| {
-            let launch_args = std::env::args().collect::<Vec<_>>();
-            let app_catalog = AppCatalog::scan();
+        .setup(move |app| {
+            timing_log("setup start");
+            let launch_args = setup_launch_args.clone();
+            migrate_gnome_hotkey_command_if_needed();
+            let resident_ready = foreground_mode && resident_ipc_ready();
+
+            let app_catalog = if foreground_mode {
+                if resident_ready {
+                    dev_log("foreground mode: resident IPC ready; app catalog scan skipped");
+                } else {
+                    dev_log("foreground mode: resident IPC unavailable; app catalog scan deferred");
+                }
+                Arc::new(RwLock::new(AppCatalog::default()))
+            } else {
+                let app_catalog = AppCatalog::scan();
+                let app_count = app_catalog.len();
+                dev_log(format!("discovered {app_count} applications"));
+                Arc::new(RwLock::new(app_catalog))
+            };
             dev_log(format!(
                 "defaults: hotkey={}, max_results={}, compact_window={}x{}, expanded_window={}x{}, theme={}, search_source={}",
                 settings::DEFAULT_HOTKEY_LABEL,
@@ -1125,38 +1931,66 @@ pub fn run() {
                 settings::DEFAULT_THEME,
                 settings::DEFAULT_SEARCH_SOURCE
             ));
-            dev_log(format!("discovered {} applications", app_catalog.len()));
-            app.manage(app_catalog);
+            app.manage(app_catalog.clone());
+
+            if foreground_mode && !resident_ready {
+                start_app_catalog_scan(app_catalog.clone(), Some(app.handle().clone()));
+            }
 
             let search_history = load_search_history_state(app.handle());
-            app.manage(search_history);
+            app.manage(search_history.clone());
 
-            let (clipboard_settings, clipboard_history) = load_clipboard_states(app.handle());
-            app.manage(clipboard_settings);
-            app.manage(clipboard_history);
+            let (clipboard_settings, clipboard_history) = if foreground_mode {
+                load_foreground_clipboard_states(app.handle())
+            } else {
+                load_clipboard_states(app.handle())
+            };
+            app.manage(clipboard_settings.clone());
+            app.manage(clipboard_history.clone());
 
-            let clipboard_settings = app.state::<ClipboardSettingsState>().inner().clone();
-            let clipboard_history = app.state::<ClipboardHistoryState>().inner().clone();
-            start_clipboard_monitor(
-                app.handle().clone(),
-                clipboard_settings,
-                clipboard_history,
-            );
+            if !foreground_mode {
+                let clipboard_settings = app.state::<ClipboardSettingsState>().inner().clone();
+                let clipboard_history = app.state::<ClipboardHistoryState>().inner().clone();
+                start_clipboard_monitor(
+                    app.handle().clone(),
+                    clipboard_settings,
+                    clipboard_history,
+                );
+            }
 
             let file_index = Arc::new(RwLock::new(FileIndex::new()));
             app.manage(file_index.clone());
-            start_file_index_scan(file_index);
+
+            if foreground_mode {
+                dev_log("foreground mode: file index scan skipped");
+            } else {
+                start_file_index_scan(file_index.clone());
+            }
+
+            if !foreground_mode {
+                start_resident_ipc_server(
+                    app.handle().clone(),
+                    app_catalog.clone(),
+                    file_index.clone(),
+                    clipboard_settings.clone(),
+                    clipboard_history.clone(),
+                    search_history.clone(),
+                );
+            }
 
             if let Some(window) = app.get_webview_window(LAUNCHER_WINDOW_LABEL) {
                 position_launcher(&window)?;
 
-                if should_toggle_from_args(&launch_args) {
-                    show_launcher(&window)?;
+                if should_show_launcher_from_args(&launch_args) {
+                    show_launcher(&window, launcher_activation_from_args(&launch_args))?;
+                    timing_log("window show requested");
                 }
             }
 
             #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-            register_launcher_shortcut(app);
+            if !foreground_mode {
+                register_launcher_shortcut(app);
+            }
 
             Ok(())
         })
@@ -1196,6 +2030,122 @@ mod tests {
             desktop_file_path: format!("/tmp/{id}"),
             terminal: false,
         }
+    }
+
+    #[test]
+    fn activation_time_parses_from_gnome_startup_id() {
+        assert_eq!(
+            activation_time_from_startup_id("rat-search-1234_TIME987654321"),
+            Some(987_654_321)
+        );
+    }
+
+    #[test]
+    fn activation_time_ignores_missing_or_invalid_startup_id() {
+        assert_eq!(activation_time_from_startup_id("rat-search-1234"), None);
+        assert_eq!(activation_time_from_startup_id("rat-search_TIME"), None);
+    }
+
+    #[test]
+    fn activation_time_parses_from_cli_args() {
+        let args = vec![
+            "rat-search".to_owned(),
+            "toggle".to_owned(),
+            STARTUP_ID_ARG.to_owned(),
+            "gnome-shell_TIME42".to_owned(),
+        ];
+
+        assert_eq!(activation_time_from_args(&args), Some(42));
+    }
+
+    #[test]
+    fn launcher_activation_parses_startup_id_time_and_xdg_token_from_cli_args() {
+        let args = vec![
+            "rat-search".to_owned(),
+            "toggle".to_owned(),
+            STARTUP_ID_ARG.to_owned(),
+            "gnome-shell_TIME42".to_owned(),
+            XDG_ACTIVATION_TOKEN_ARG.to_owned(),
+            "token-123".to_owned(),
+        ];
+
+        assert_eq!(
+            launcher_activation_from_args(&args),
+            LauncherActivation {
+                startup_id: Some("gnome-shell_TIME42".to_owned()),
+                activation_time: Some(42),
+                xdg_activation_token: Some("token-123".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn launcher_activation_ignores_empty_cli_values() {
+        let args = vec![
+            "rat-search".to_owned(),
+            "toggle".to_owned(),
+            STARTUP_ID_ARG.to_owned(),
+            "".to_owned(),
+            XDG_ACTIVATION_TOKEN_ARG.to_owned(),
+            " ".to_owned(),
+        ];
+
+        assert_eq!(
+            launcher_activation_from_args(&args),
+            LauncherActivation::default()
+        );
+    }
+
+    #[test]
+    fn foreground_arg_requests_visible_launcher_without_toggle_arg() {
+        let args = vec!["rat-search".to_owned(), FOREGROUND_ARG.to_owned()];
+
+        assert!(should_launch_foreground_from_args(&args));
+        assert!(should_show_launcher_from_args(&args));
+        assert!(!should_toggle_from_args(&args));
+    }
+
+    #[test]
+    fn pid_parser_rejects_invalid_or_zero_values() {
+        assert_eq!(parse_pid("123"), Some(123));
+        assert_eq!(parse_pid("0"), None);
+        assert_eq!(parse_pid("abc"), None);
+    }
+
+    #[test]
+    fn rat_search_hotkey_command_detection_handles_old_and_new_commands() {
+        assert!(is_legacy_rat_search_hotkey_command("rat-search toggle"));
+        assert!(is_legacy_rat_search_hotkey_command(
+            "/usr/bin/rat-search toggle"
+        ));
+        assert!(is_legacy_rat_search_hotkey_command(
+            r#"/bin/sh -c 'rat-search toggle --startup-id "$DESKTOP_STARTUP_ID"'"#
+        ));
+        assert!(!is_legacy_rat_search_hotkey_command(GNOME_HOTKEY_COMMAND));
+        assert!(is_current_rat_search_hotkey_command(GNOME_HOTKEY_COMMAND));
+        assert!(is_rat_search_hotkey_binding(
+            "Rat Search",
+            GNOME_HOTKEY_COMMAND
+        ));
+        assert!(GNOME_HOTKEY_COMMAND.contains("rat-search foreground"));
+    }
+
+    #[test]
+    fn gsettings_helpers_parse_and_quote_values() {
+        assert_eq!(
+            parse_gsettings_path_array(
+                "['/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/']"
+            ),
+            vec!["/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/"]
+        );
+        assert_eq!(
+            unquote_gsettings_string("'rat-search toggle'"),
+            "rat-search toggle"
+        );
+        assert_eq!(
+            quote_gsettings_string(r#"rat-search "toggle""#),
+            r#""rat-search \"toggle\"""#
+        );
     }
 
     fn catalog(apps: Vec<AppRecord>) -> AppCatalog {

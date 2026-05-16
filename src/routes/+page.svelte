@@ -112,6 +112,11 @@
     max_text_bytes: number;
   };
 
+  type RatSearchWindow = Window &
+    typeof globalThis & {
+      __ratSearchFocusInput?: () => void;
+    };
+
   let query = $state("");
   let isExpanded = $state(false);
   let isCollapsing = $state(false);
@@ -133,13 +138,34 @@
   let collapseTimer: ReturnType<typeof setTimeout> | null = null;
 
   const COLLAPSE_TRANSITION_MS = 120;
+  const INPUT_FOCUS_RETRY_MS = [0, 40, 100, 220, 420];
 
   $effect(() => {
     void loadResults(query);
   });
 
+  function isSearchInputFocused() {
+    return typeof document !== "undefined" && document.activeElement === searchInput;
+  }
+
+  function focusSearchInputNow() {
+    searchInput?.focus({ preventScroll: true });
+  }
+
   function focusSearchInput() {
-    requestAnimationFrame(() => searchInput?.focus());
+    for (const delayMs of INPUT_FOCUS_RETRY_MS) {
+      setTimeout(() => {
+        if (!isSearchInputFocused()) {
+          focusSearchInputNow();
+        }
+      }, delayMs);
+    }
+
+    requestAnimationFrame(focusSearchInputNow);
+  }
+
+  function ratSearchWindow() {
+    return window as RatSearchWindow;
   }
 
   function prefersReducedMotion() {
@@ -790,14 +816,19 @@
   }
 
   onMount(() => {
+    ratSearchWindow().__ratSearchFocusInput = focusSearchInput;
     focusSearchInput();
 
     if (!isTauri()) {
       return;
     }
 
+    void invoke("frontend_ready").catch((error) => {
+      console.error("failed to report frontend readiness", error);
+    });
+
     let disposed = false;
-    let unlisten: UnlistenFn | undefined;
+    const unlisteners: UnlistenFn[] = [];
 
     void listen("launcher:shown", () => {
       query = "";
@@ -811,16 +842,34 @@
           return;
         }
 
-        unlisten = unlistenListener;
+        unlisteners.push(unlistenListener);
       })
       .catch((error) => {
         console.error("failed to listen for launcher focus event", error);
       });
 
+    void listen("launcher:catalog-ready", () => {
+      if (query.trim().length > 0) {
+        void loadResults(query);
+      }
+    })
+      .then((unlistenListener) => {
+        if (disposed) {
+          unlistenListener();
+          return;
+        }
+
+        unlisteners.push(unlistenListener);
+      })
+      .catch((error) => {
+        console.error("failed to listen for launcher catalog event", error);
+      });
+
     return () => {
       disposed = true;
       clearCollapseTimer();
-      unlisten?.();
+      delete ratSearchWindow().__ratSearchFocusInput;
+      unlisteners.forEach((unlisten) => unlisten());
     };
   });
 
