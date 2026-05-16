@@ -1,7 +1,7 @@
 # Local Run, Packaging, and Autostart
 
-This guide covers the v0.5 local run, Linux packaging path, and startup
-preparation for Rat Search.
+This guide covers local development, Linux packaging, Version 1 startup setup,
+and GNOME Wayland hotkey behavior for Rat Search.
 
 ## Local Development
 
@@ -17,7 +17,7 @@ Expected behavior:
 - The launcher window starts hidden.
 - `Alt+Space` toggles the launcher on X11.
 - On Wayland, global shortcut registration is skipped; bind your desktop
-  shortcut to `rat-search foreground`.
+  shortcut to the setup-script shell command that runs `rat-search foreground`.
 - Search results use in-memory app and file/folder catalogs scanned at startup,
   plus lightweight search history and clipboard state loaded from app data.
 - `open <folder>` and `open <code-like-file>` results open in Visual Studio
@@ -52,7 +52,7 @@ Linux build artifacts are written under:
 src-tauri/target/release/bundle/
 ```
 
-Version 0.5 builds Debian and RPM packages by default:
+Version 1 builds Debian and RPM packages by default:
 
 ```text
 src-tauri/target/release/bundle/deb/
@@ -63,39 +63,50 @@ After installing or launching the packaged build, Rat Search should run like a
 small desktop utility: resident in the background, hidden until invoked, and
 ready for the hotkey.
 
-## Autostart Preparation
+## Version 1 Autostart And Hotkey
 
-Autostart is useful for Rat Search because the app should already be warm when
-the user presses the launcher hotkey. Version 0.5 prepares for that workflow but
-does not enable it automatically.
+Autostart is useful for Rat Search because the resident process should already
+be warm when the user presses the launcher hotkey. Version 1 enables this with
+the current-user setup script after package install:
 
-Startup is not auto-enabled in this release because there is no settings screen or
-explicit consent flow yet. A later settings step can use the official Tauri v2
-autostart plugin:
-
-```text
-https://v2.tauri.app/plugin/autostart/
+```bash
+bash /home/sanuk/Desktop/Projects/rat_search/scripts/setup_ubuntu_user_startup.sh
 ```
 
-That future implementation should add the plugin dependency, initialize it in
-Rust, and grant only the required autostart permissions.
+The autostart entry launches the resident app:
 
-Until then, the manual Linux fallback is to install/package Rat Search normally
-and add the installed app to Ubuntu's Startup Applications list. The startup
-entry should launch Rat Search itself, not `rat-search toggle` or
-`rat-search foreground`; the app should remain resident with the window hidden
-after startup.
+```text
+Exec=rat-search
+```
+
+The GNOME Wayland shortcut runs a foreground launcher:
+
+```bash
+/bin/sh -c 'exec rat-search foreground --startup-id "$DESKTOP_STARTUP_ID" --xdg-activation-token "$XDG_ACTIVATION_TOKEN"'
+```
+
+The foreground launcher exists because GNOME Wayland focus prevention is more
+reliable when the visible window is created by the user-activated shortcut
+process. The resident process remains responsible for warm app/file/history
+state through local IPC.
+
+To disable startup and Rat Search custom shortcuts, run:
+
+```bash
+bash /home/sanuk/Desktop/Projects/rat_search/scripts/disable_ubuntu_user_startup.sh
+```
 
 ## Performance Notes
 
 Autostart means Rat Search uses some RAM while idle. CPU use should be near zero
 after initial startup work finishes.
 
-The main startup costs in v0.5 are scanning installed `.desktop` application
+The main resident startup costs in Version 1 are scanning installed `.desktop` application
 entries, indexing conservative user folders once, loading lightweight search
 history, and loading clipboard settings/history from app data. Clipboard polling
 runs only as a lightweight text read loop, and storage remains inactive until
 clipboard history is enabled.
 
-The v0.5 acceptance target is that Rat Search remains comfortable on an Ubuntu
-machine with 8GB RAM.
+Foreground mode skips warmup and asks the resident process for search results
+and actions over local IPC. Tauri/WebKit startup cost can still affect how
+quickly the foreground window appears.
