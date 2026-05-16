@@ -1,10 +1,10 @@
 use std::process::Command;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::app_discovery::{AppCatalog, AppRecord};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct LaunchResult {
     pub(crate) app_id: String,
     pub(crate) name: String,

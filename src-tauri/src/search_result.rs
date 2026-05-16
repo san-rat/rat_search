@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SearchSource {
     Applications,
@@ -15,7 +15,7 @@ pub(crate) enum SearchSource {
     History,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SearchAction {
     LaunchApp,
@@ -32,7 +32,7 @@ pub(crate) enum SearchAction {
     ReuseQuery,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SearchResult {
     pub(crate) id: String,
     pub(crate) title: String,
@@ -45,7 +45,7 @@ pub(crate) struct SearchResult {
     pub(crate) metadata: Option<SearchMetadata>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum SearchMetadata {
     Application {

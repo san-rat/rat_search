@@ -4,10 +4,10 @@ use std::{
     process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, RwLock,
+        Arc, OnceLock, RwLock,
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::Serialize;
@@ -24,6 +24,7 @@ mod file_actions;
 mod file_icons;
 mod file_index;
 mod file_search;
+mod ipc;
 mod search_history;
 mod search_result;
 mod settings;
@@ -36,6 +37,7 @@ use clipboard_history::{ClipboardHistory, ClipboardRecordOutcome};
 use clipboard_settings::ClipboardSettings;
 use file_actions::{PreferredOpen, ValidatedPath};
 use file_index::FileIndex;
+use ipc::{IpcRequest, IpcResponse};
 use search_history::SearchHistory;
 use search_result::{SearchAction, SearchResult, SearchSource};
 use settings_search::PreparedSettingCommand;
@@ -79,6 +81,7 @@ const GNOME_CUSTOM_KEYBINDING_SCHEMA: &str =
 const FOREGROUND_PID_FILE_NAME: &str = "rat-search-foreground.pid";
 
 static FOREGROUND_LAUNCHER_MODE: AtomicBool = AtomicBool::new(false);
+static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct LauncherActivation {
@@ -94,6 +97,15 @@ fn dev_log(message: impl AsRef<str>) {
 
 #[cfg(not(debug_assertions))]
 fn dev_log(_message: impl AsRef<str>) {}
+
+fn timing_log(label: &str) {
+    if let Some(start) = PROCESS_START.get() {
+        dev_log(format!(
+            "timing: {label} at {}ms",
+            start.elapsed().as_millis()
+        ));
+    }
+}
 
 #[cfg(target_os = "linux")]
 fn initialize_linux_window_backend() {
@@ -678,6 +690,11 @@ fn close_launcher(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn frontend_ready() {
+    timing_log("frontend ready");
+}
+
+#[tauri::command]
 fn hide_launcher(app: tauri::AppHandle) -> Result<(), String> {
     hide_launcher_for_app(&app)
 }
@@ -1075,13 +1092,20 @@ fn spawn_setting_command(command: &PreparedSettingCommand) -> Result<(), String>
         })
 }
 
-#[tauri::command]
-fn open_path(
-    app: tauri::AppHandle,
-    file_index: tauri::State<'_, FileIndexState>,
-    path: String,
+fn launch_app_action(catalog: &AppCatalogState, app_id: &str) -> Result<LaunchResult, String> {
+    let catalog = catalog
+        .read()
+        .map_err(|_| "Application catalog unavailable".to_owned())?;
+
+    app_launch::launch_app(&catalog, app_id)
+}
+
+fn open_path_action(
+    app: &tauri::AppHandle,
+    file_index: &FileIndexState,
+    path: &str,
 ) -> Result<(), String> {
-    let validated_path = validate_file_action_path(&file_index, &path)?;
+    let validated_path = validate_file_action_path(file_index, path)?;
 
     app.opener()
         .open_path(path_for_opener(&validated_path.path), None::<&str>)
@@ -1091,24 +1115,21 @@ fn open_path(
                 validated_path.path.display()
             );
             "Could not open item".to_owned()
-        })?;
-
-    hide_launcher_for_app(&app)
+        })
 }
 
-#[tauri::command]
-fn open_in_code(
-    app: tauri::AppHandle,
-    file_index: tauri::State<'_, FileIndexState>,
-    path: String,
+fn open_in_code_action(
+    app: &tauri::AppHandle,
+    file_index: &FileIndexState,
+    path: &str,
 ) -> Result<(), String> {
-    let validated_path = validate_file_action_path(&file_index, &path)?;
+    let validated_path = validate_file_action_path(file_index, path)?;
     let preferred_open = file_actions::prepare_open_in_code(&validated_path);
 
     match preferred_open {
         PreferredOpen::Code(command) => {
             if spawn_prepared_command(&command).is_ok() {
-                return hide_launcher_for_app(&app);
+                return Ok(());
             }
         }
         PreferredOpen::System => {}
@@ -1122,18 +1143,15 @@ fn open_in_code(
                 validated_path.path.display()
             );
             "Could not open item".to_owned()
-        })?;
-
-    hide_launcher_for_app(&app)
+        })
 }
 
-#[tauri::command]
-fn reveal_path(
-    app: tauri::AppHandle,
-    file_index: tauri::State<'_, FileIndexState>,
-    path: String,
+fn reveal_path_action(
+    app: &tauri::AppHandle,
+    file_index: &FileIndexState,
+    path: &str,
 ) -> Result<(), String> {
-    let validated_path = validate_file_action_path(&file_index, &path)?;
+    let validated_path = validate_file_action_path(file_index, path)?;
     let reveal_target = file_actions::reveal_target(&validated_path)?;
 
     app.opener()
@@ -1144,18 +1162,15 @@ fn reveal_path(
                 reveal_target.display()
             );
             "Could not open item".to_owned()
-        })?;
-
-    hide_launcher_for_app(&app)
+        })
 }
 
-#[tauri::command]
-fn copy_path(
-    app: tauri::AppHandle,
-    file_index: tauri::State<'_, FileIndexState>,
-    path: String,
+fn copy_path_action(
+    app: &tauri::AppHandle,
+    file_index: &FileIndexState,
+    path: &str,
 ) -> Result<(), String> {
-    let validated_path = validate_file_action_path(&file_index, &path)?;
+    let validated_path = validate_file_action_path(file_index, path)?;
 
     app.clipboard()
         .write_text(path_for_opener(&validated_path.path))
@@ -1165,22 +1180,168 @@ fn copy_path(
                 validated_path.path.display()
             );
             "Could not complete action".to_owned()
-        })?;
-
-    hide_launcher_for_app(&app)
+        })
 }
 
-#[tauri::command]
-fn copy_text(app: tauri::AppHandle, text: String) -> Result<(), String> {
-    let text = validate_copy_text(&text)?;
+fn copy_text_action(app: &tauri::AppHandle, text: &str) -> Result<(), String> {
+    let text = validate_copy_text(text)?;
 
     app.clipboard()
         .write_text(text.to_owned())
         .map_err(|error| {
             eprintln!("failed to copy text: {error}");
             "Could not complete action".to_owned()
-        })?;
+        })
+}
 
+fn open_calculator_app_action(
+    app: &tauri::AppHandle,
+    expression: &str,
+    result: &str,
+    copy_text: &str,
+) -> Result<(), String> {
+    let command = calculator::prepare_calculator_app_command(expression, result, copy_text)?;
+
+    spawn_calculator_command(&command)?;
+
+    if command.copy_fallback {
+        app.clipboard()
+            .write_text(copy_text.to_owned())
+            .map_err(|error| {
+                eprintln!("failed to copy calculator fallback text: {error}");
+                "Could not open calculator".to_owned()
+            })?;
+    }
+
+    Ok(())
+}
+
+fn open_url_action(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
+    if !web_shortcuts::is_allowed_url(url) {
+        return Err("Could not open item".to_owned());
+    }
+
+    app.opener()
+        .open_url(url.to_owned(), None::<&str>)
+        .map_err(|error| {
+            eprintln!("failed to open url: {error}");
+            "Could not open item".to_owned()
+        })
+}
+
+fn open_setting_action(setting_id: &str) -> Result<(), String> {
+    let command = prepare_setting_command(setting_id)?;
+
+    spawn_setting_command(&command)
+}
+
+fn copy_clipboard_item_action(
+    app: &tauri::AppHandle,
+    history: &ClipboardHistoryState,
+    item_id: &str,
+) -> Result<(), String> {
+    let text = clipboard_item_text_from_state(history, item_id)?;
+
+    app.clipboard().write_text(text).map_err(|error| {
+        eprintln!("failed to copy clipboard history item: {error}");
+        "Could not complete action".to_owned()
+    })?;
+
+    mark_clipboard_item_copied_in_state(history, item_id, current_time_ms())
+}
+
+fn foreground_ipc_request(request: IpcRequest) -> Result<IpcResponse, String> {
+    if !FOREGROUND_LAUNCHER_MODE.load(Ordering::Relaxed) {
+        return Err("not in foreground mode".to_owned());
+    }
+
+    ipc::send_request(&request)
+}
+
+fn foreground_ipc_unit(app: &tauri::AppHandle, request: IpcRequest) -> Option<Result<(), String>> {
+    match foreground_ipc_request(request) {
+        Ok(IpcResponse::Unit) => Some(hide_launcher_for_app(app)),
+        Ok(IpcResponse::Error { message }) => Some(Err(message)),
+        Ok(_) => Some(Err("Unexpected resident response".to_owned())),
+        Err(error) => {
+            dev_log(format!(
+                "foreground IPC unavailable; using local fallback: {error}"
+            ));
+            None
+        }
+    }
+}
+
+fn resident_ipc_ready() -> bool {
+    matches!(
+        ipc::send_request(&IpcRequest::Health),
+        Ok(IpcResponse::Health { ready: true })
+    )
+}
+
+#[tauri::command]
+fn open_path(
+    app: tauri::AppHandle,
+    file_index: tauri::State<'_, FileIndexState>,
+    path: String,
+) -> Result<(), String> {
+    if let Some(result) = foreground_ipc_unit(&app, IpcRequest::OpenPath { path: path.clone() }) {
+        return result;
+    }
+
+    open_path_action(&app, &file_index, &path)?;
+    hide_launcher_for_app(&app)
+}
+
+#[tauri::command]
+fn open_in_code(
+    app: tauri::AppHandle,
+    file_index: tauri::State<'_, FileIndexState>,
+    path: String,
+) -> Result<(), String> {
+    if let Some(result) = foreground_ipc_unit(&app, IpcRequest::OpenInCode { path: path.clone() }) {
+        return result;
+    }
+
+    open_in_code_action(&app, &file_index, &path)?;
+    hide_launcher_for_app(&app)
+}
+
+#[tauri::command]
+fn reveal_path(
+    app: tauri::AppHandle,
+    file_index: tauri::State<'_, FileIndexState>,
+    path: String,
+) -> Result<(), String> {
+    if let Some(result) = foreground_ipc_unit(&app, IpcRequest::RevealPath { path: path.clone() }) {
+        return result;
+    }
+
+    reveal_path_action(&app, &file_index, &path)?;
+    hide_launcher_for_app(&app)
+}
+
+#[tauri::command]
+fn copy_path(
+    app: tauri::AppHandle,
+    file_index: tauri::State<'_, FileIndexState>,
+    path: String,
+) -> Result<(), String> {
+    if let Some(result) = foreground_ipc_unit(&app, IpcRequest::CopyPath { path: path.clone() }) {
+        return result;
+    }
+
+    copy_path_action(&app, &file_index, &path)?;
+    hide_launcher_for_app(&app)
+}
+
+#[tauri::command]
+fn copy_text(app: tauri::AppHandle, text: String) -> Result<(), String> {
+    if let Some(result) = foreground_ipc_unit(&app, IpcRequest::CopyText { text: text.clone() }) {
+        return result;
+    }
+
+    copy_text_action(&app, &text)?;
     hide_launcher_for_app(&app)
 }
 
@@ -1191,17 +1352,18 @@ fn open_calculator_app(
     result: String,
     copy_text: String,
 ) -> Result<(), String> {
-    let command = calculator::prepare_calculator_app_command(&expression, &result, &copy_text)?;
-
-    spawn_calculator_command(&command)?;
-
-    if command.copy_fallback {
-        app.clipboard().write_text(copy_text).map_err(|error| {
-            eprintln!("failed to copy calculator fallback text: {error}");
-            "Could not open calculator".to_owned()
-        })?;
+    if let Some(result) = foreground_ipc_unit(
+        &app,
+        IpcRequest::OpenCalculatorApp {
+            expression: expression.clone(),
+            result: result.clone(),
+            copy_text: copy_text.clone(),
+        },
+    ) {
+        return result;
     }
 
+    open_calculator_app_action(&app, &expression, &result, &copy_text)?;
     hide_launcher_for_app(&app)
 }
 
@@ -1229,6 +1391,19 @@ fn delete_clipboard_item(
     history: tauri::State<'_, ClipboardHistoryState>,
     item_id: String,
 ) -> Result<(), String> {
+    if FOREGROUND_LAUNCHER_MODE.load(Ordering::Relaxed) {
+        match foreground_ipc_request(IpcRequest::DeleteClipboardItem {
+            item_id: item_id.clone(),
+        }) {
+            Ok(IpcResponse::Unit) => return Ok(()),
+            Ok(IpcResponse::Error { message }) => return Err(message),
+            Ok(_) => return Err("Unexpected resident response".to_owned()),
+            Err(error) => dev_log(format!(
+                "foreground IPC unavailable; using local clipboard fallback: {error}"
+            )),
+        }
+    }
+
     delete_clipboard_item_in_state(&history, &item_id)
 }
 
@@ -1238,14 +1413,16 @@ fn copy_clipboard_item(
     history: tauri::State<'_, ClipboardHistoryState>,
     item_id: String,
 ) -> Result<(), String> {
-    let text = clipboard_item_text_from_state(&history, &item_id)?;
+    if let Some(result) = foreground_ipc_unit(
+        &app,
+        IpcRequest::CopyClipboardItem {
+            item_id: item_id.clone(),
+        },
+    ) {
+        return result;
+    }
 
-    app.clipboard().write_text(text).map_err(|error| {
-        eprintln!("failed to copy clipboard history item: {error}");
-        "Could not complete action".to_owned()
-    })?;
-
-    mark_clipboard_item_copied_in_state(&history, &item_id, current_time_ms())?;
+    copy_clipboard_item_action(&app, &history, &item_id)?;
     hide_launcher_for_app(&app)
 }
 
@@ -1259,24 +1436,26 @@ fn get_clipboard_privacy_status(
 
 #[tauri::command]
 fn open_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
-    if !web_shortcuts::is_allowed_url(&url) {
-        return Err("Could not open item".to_owned());
+    if let Some(result) = foreground_ipc_unit(&app, IpcRequest::OpenUrl { url: url.clone() }) {
+        return result;
     }
 
-    app.opener().open_url(url, None::<&str>).map_err(|error| {
-        eprintln!("failed to open url: {error}");
-        "Could not open item".to_owned()
-    })?;
-
+    open_url_action(&app, &url)?;
     hide_launcher_for_app(&app)
 }
 
 #[tauri::command]
 fn open_setting(app: tauri::AppHandle, setting_id: String) -> Result<(), String> {
-    let command = prepare_setting_command(&setting_id)?;
+    if let Some(result) = foreground_ipc_unit(
+        &app,
+        IpcRequest::OpenSetting {
+            setting_id: setting_id.clone(),
+        },
+    ) {
+        return result;
+    }
 
-    spawn_setting_command(&command)?;
-
+    open_setting_action(&setting_id)?;
     hide_launcher_for_app(&app)
 }
 
@@ -1285,6 +1464,19 @@ fn record_search_history(
     history: tauri::State<'_, SearchHistoryState>,
     query: String,
 ) -> Result<(), String> {
+    if FOREGROUND_LAUNCHER_MODE.load(Ordering::Relaxed) {
+        match foreground_ipc_request(IpcRequest::RecordSearchHistory {
+            query: query.clone(),
+        }) {
+            Ok(IpcResponse::Unit) => return Ok(()),
+            Ok(IpcResponse::Error { message }) => return Err(message),
+            Ok(_) => return Err("Unexpected resident response".to_owned()),
+            Err(error) => dev_log(format!(
+                "foreground IPC unavailable; using local history fallback: {error}"
+            )),
+        }
+    }
+
     record_search_history_in_state(&history, &query, current_time_ms())
 }
 
@@ -1335,6 +1527,107 @@ fn start_file_index_scan(file_index: FileIndexState) {
             }
         }
     });
+}
+
+fn start_resident_ipc_server(
+    app: tauri::AppHandle,
+    catalog: AppCatalogState,
+    file_index: FileIndexState,
+    clipboard_settings: ClipboardSettingsState,
+    clipboard_history: ClipboardHistoryState,
+    search_history: SearchHistoryState,
+) {
+    match ipc::start_server(move |request| {
+        handle_resident_ipc_request(
+            &app,
+            &catalog,
+            &file_index,
+            &clipboard_settings,
+            &clipboard_history,
+            &search_history,
+            request,
+        )
+    }) {
+        Ok(path) => dev_log(format!("resident IPC listening at {}", path.display())),
+        Err(error) => eprintln!("failed to start resident IPC server: {error}"),
+    }
+}
+
+fn handle_resident_ipc_request(
+    app: &tauri::AppHandle,
+    catalog: &AppCatalogState,
+    file_index: &FileIndexState,
+    clipboard_settings: &ClipboardSettingsState,
+    clipboard_history: &ClipboardHistoryState,
+    search_history: &SearchHistoryState,
+    request: IpcRequest,
+) -> IpcResponse {
+    match request {
+        IpcRequest::Health => IpcResponse::Health { ready: true },
+        IpcRequest::Search { query, limit } => {
+            let catalog_guard = catalog.read().ok();
+            let file_index_guard = file_index.read().ok();
+            let clipboard_settings_guard = clipboard_settings.read().ok();
+            let clipboard_history_guard = clipboard_history.read().ok();
+            let search_history_guard = search_history.read().ok();
+            let empty_catalog = AppCatalog::default();
+            let catalog = catalog_guard.as_deref().unwrap_or(&empty_catalog);
+            let results = search_all(
+                catalog,
+                file_index_guard.as_deref(),
+                clipboard_settings_guard.as_deref(),
+                clipboard_history_guard.as_deref(),
+                search_history_guard.as_deref(),
+                &query,
+                limit,
+            );
+
+            IpcResponse::Search { results }
+        }
+        IpcRequest::RecordSearchHistory { query } => unit_response(record_search_history_in_state(
+            search_history,
+            &query,
+            current_time_ms(),
+        )),
+        IpcRequest::LaunchApp { app_id } => match launch_app_action(catalog, &app_id) {
+            Ok(result) => IpcResponse::LaunchApp { result },
+            Err(message) => IpcResponse::Error { message },
+        },
+        IpcRequest::OpenPath { path } => unit_response(open_path_action(app, file_index, &path)),
+        IpcRequest::OpenInCode { path } => {
+            unit_response(open_in_code_action(app, file_index, &path))
+        }
+        IpcRequest::RevealPath { path } => {
+            unit_response(reveal_path_action(app, file_index, &path))
+        }
+        IpcRequest::CopyPath { path } => unit_response(copy_path_action(app, file_index, &path)),
+        IpcRequest::CopyText { text } => unit_response(copy_text_action(app, &text)),
+        IpcRequest::OpenCalculatorApp {
+            expression,
+            result,
+            copy_text,
+        } => unit_response(open_calculator_app_action(
+            app,
+            &expression,
+            &result,
+            &copy_text,
+        )),
+        IpcRequest::OpenUrl { url } => unit_response(open_url_action(app, &url)),
+        IpcRequest::OpenSetting { setting_id } => unit_response(open_setting_action(&setting_id)),
+        IpcRequest::CopyClipboardItem { item_id } => {
+            unit_response(copy_clipboard_item_action(app, clipboard_history, &item_id))
+        }
+        IpcRequest::DeleteClipboardItem { item_id } => {
+            unit_response(delete_clipboard_item_in_state(clipboard_history, &item_id))
+        }
+    }
+}
+
+fn unit_response(result: Result<(), String>) -> IpcResponse {
+    match result {
+        Ok(()) => IpcResponse::Unit,
+        Err(message) => IpcResponse::Error { message },
+    }
 }
 
 fn search_all(
@@ -1440,6 +1733,30 @@ fn search(
     query: String,
     limit: usize,
 ) -> Vec<SearchResult> {
+    timing_log("first search request");
+    if FOREGROUND_LAUNCHER_MODE.load(Ordering::Relaxed) {
+        match foreground_ipc_request(IpcRequest::Search {
+            query: query.clone(),
+            limit,
+        }) {
+            Ok(IpcResponse::Search { results }) => {
+                timing_log("resident search response");
+                return results;
+            }
+            Ok(IpcResponse::Error { message }) => {
+                eprintln!("resident search failed: {message}");
+                return Vec::new();
+            }
+            Ok(_) => {
+                eprintln!("resident search returned unexpected response");
+                return Vec::new();
+            }
+            Err(error) => dev_log(format!(
+                "foreground IPC unavailable; using local search fallback: {error}"
+            )),
+        }
+    }
+
     let catalog_guard = match catalog.read() {
         Ok(catalog) => Some(catalog),
         Err(error) => {
@@ -1508,11 +1825,23 @@ fn launch_app(
     catalog: tauri::State<'_, AppCatalogState>,
     app_id: String,
 ) -> Result<LaunchResult, String> {
-    let catalog = catalog
-        .read()
-        .map_err(|_| "Application catalog unavailable".to_owned())?;
-    let result = app_launch::launch_app(&catalog, &app_id)?;
+    if FOREGROUND_LAUNCHER_MODE.load(Ordering::Relaxed) {
+        match foreground_ipc_request(IpcRequest::LaunchApp {
+            app_id: app_id.clone(),
+        }) {
+            Ok(IpcResponse::LaunchApp { result }) => {
+                hide_launcher_for_app(&app)?;
+                return Ok(result);
+            }
+            Ok(IpcResponse::Error { message }) => return Err(message),
+            Ok(_) => return Err("Unexpected resident response".to_owned()),
+            Err(error) => dev_log(format!(
+                "foreground IPC unavailable; using local app launch fallback: {error}"
+            )),
+        }
+    }
 
+    let result = launch_app_action(&catalog, &app_id)?;
     hide_launcher_for_app(&app)?;
 
     Ok(result)
@@ -1520,6 +1849,8 @@ fn launch_app(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let _ = PROCESS_START.set(Instant::now());
+    timing_log("process start");
     initialize_linux_window_backend();
 
     let launch_args = std::env::args().collect::<Vec<_>>();
@@ -1556,6 +1887,7 @@ pub fn run() {
             delete_clipboard_item,
             disable_clipboard_history,
             enable_clipboard_history,
+            frontend_ready,
             get_clipboard_privacy_status,
             hide_launcher,
             launch_app,
@@ -1570,11 +1902,17 @@ pub fn run() {
             set_launcher_expanded
         ])
         .setup(move |app| {
+            timing_log("setup start");
             let launch_args = setup_launch_args.clone();
             migrate_gnome_hotkey_command_if_needed();
+            let resident_ready = foreground_mode && resident_ipc_ready();
 
             let app_catalog = if foreground_mode {
-                dev_log("foreground mode: app catalog scan deferred");
+                if resident_ready {
+                    dev_log("foreground mode: resident IPC ready; app catalog scan skipped");
+                } else {
+                    dev_log("foreground mode: resident IPC unavailable; app catalog scan deferred");
+                }
                 Arc::new(RwLock::new(AppCatalog::default()))
             } else {
                 let app_catalog = AppCatalog::scan();
@@ -1595,20 +1933,20 @@ pub fn run() {
             ));
             app.manage(app_catalog.clone());
 
-            if foreground_mode {
-                start_app_catalog_scan(app_catalog, Some(app.handle().clone()));
+            if foreground_mode && !resident_ready {
+                start_app_catalog_scan(app_catalog.clone(), Some(app.handle().clone()));
             }
 
             let search_history = load_search_history_state(app.handle());
-            app.manage(search_history);
+            app.manage(search_history.clone());
 
             let (clipboard_settings, clipboard_history) = if foreground_mode {
                 load_foreground_clipboard_states(app.handle())
             } else {
                 load_clipboard_states(app.handle())
             };
-            app.manage(clipboard_settings);
-            app.manage(clipboard_history);
+            app.manage(clipboard_settings.clone());
+            app.manage(clipboard_history.clone());
 
             if !foreground_mode {
                 let clipboard_settings = app.state::<ClipboardSettingsState>().inner().clone();
@@ -1626,7 +1964,18 @@ pub fn run() {
             if foreground_mode {
                 dev_log("foreground mode: file index scan skipped");
             } else {
-                start_file_index_scan(file_index);
+                start_file_index_scan(file_index.clone());
+            }
+
+            if !foreground_mode {
+                start_resident_ipc_server(
+                    app.handle().clone(),
+                    app_catalog.clone(),
+                    file_index.clone(),
+                    clipboard_settings.clone(),
+                    clipboard_history.clone(),
+                    search_history.clone(),
+                );
             }
 
             if let Some(window) = app.get_webview_window(LAUNCHER_WINDOW_LABEL) {
@@ -1634,6 +1983,7 @@ pub fn run() {
 
                 if should_show_launcher_from_args(&launch_args) {
                     show_launcher(&window, launcher_activation_from_args(&launch_args))?;
+                    timing_log("window show requested");
                 }
             }
 

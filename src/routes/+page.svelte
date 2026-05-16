@@ -823,6 +823,10 @@
       return;
     }
 
+    void invoke("frontend_ready").catch((error) => {
+      console.error("failed to report frontend readiness", error);
+    });
+
     let disposed = false;
     const unlisteners: UnlistenFn[] = [];
 
