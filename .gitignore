@@ -1,6 +1,10 @@
 # Codex
 .codex
 
+# Local Claude configuration and instructions
+.claude/
+CLAUDE.md
+
 # Node / Vite / Svelte
 node_modules/
 dist/
@@ -28,8 +32,8 @@ src-tauri/.cargo/
 tmp/
 temp/
 
-# Local append-only work log
-docs/work/work_done.md
+# Local documentation and work logs
+/docs/
 
 # Editor / OS noise
 .vscode/*
@@ -38,6 +42,3 @@ docs/work/work_done.md
 .idea/
 .DS_Store
 Thumbs.db
-
-
-docs/guides
