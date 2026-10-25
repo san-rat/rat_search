@@ -112,6 +112,19 @@
     max_text_bytes: number;
   };
 
+  type CatalogStatus = {
+    phase: "scanning" | "ready" | "error";
+    app_count: number;
+    file_count: number;
+    updated_at_ms: number | null;
+    message: string | null;
+  };
+
+  type IndexConfiguration = {
+    roots: string[];
+    exclusions: string[];
+  };
+
   type RatSearchWindow = Window &
     typeof globalThis & {
       __ratSearchFocusInput?: () => void;
@@ -132,6 +145,12 @@
   let clipboardPrivacyError = $state<string | null>(null);
   let isClipboardPrivacyBusy = $state(false);
   let hasConfirmedClipboardEnable = $state(false);
+  let isIndexPanelOpen = $state(false);
+  let catalogStatus = $state<CatalogStatus | null>(null);
+  let indexRootsText = $state("");
+  let indexExclusionsText = $state("");
+  let indexSettingsError = $state<string | null>(null);
+  let isIndexBusy = $state(false);
   let searchInput: HTMLInputElement;
   let searchRequestId = 0;
   let requestedExpandedState: boolean | null = null;
@@ -203,6 +222,79 @@
 
     if (isPrivacyPanelOpen) {
       void refreshClipboardPrivacyStatus();
+    }
+  }
+
+  async function loadIndexConfiguration() {
+    try {
+      const configuration = await invoke<IndexConfiguration>("get_index_configuration");
+      indexRootsText = configuration.roots.join("\n");
+      indexExclusionsText = configuration.exclusions.join("\n");
+      indexSettingsError = null;
+    } catch (error) {
+      console.error("failed to load index settings", error);
+      indexSettingsError = "Index settings unavailable";
+    }
+  }
+
+  async function toggleIndexPanel() {
+    isIndexPanelOpen = !isIndexPanelOpen;
+    isPrivacyPanelOpen = false;
+    if (isIndexPanelOpen) {
+      isExpanded = true;
+      isVisuallyCompact = false;
+      hasExpandedThisSession = true;
+      await setNativeExpanded(true);
+      await Promise.all([loadIndexConfiguration(), refreshCatalogStatus()]);
+      void monitorCatalogStatus();
+    } else if (!query.trim()) {
+      await resetToNativeCompact();
+    }
+  }
+
+  async function refreshCatalogStatus() {
+    try {
+      catalogStatus = await invoke<CatalogStatus>("get_catalog_status");
+    } catch (error) {
+      console.error("failed to load catalog status", error);
+      indexSettingsError = "Catalog status unavailable";
+    }
+  }
+
+  async function monitorCatalogStatus() {
+    for (let attempt = 0; attempt < 180; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      await refreshCatalogStatus();
+      if (catalogStatus?.phase !== "scanning") break;
+    }
+    if (query.trim()) await loadResults(query);
+  }
+
+  async function runIndexCommand(command: "refresh_catalogs" | "update_index_configuration" | "reset_index_configuration") {
+    if (!isTauri() || isIndexBusy) return;
+    isIndexBusy = true;
+    indexSettingsError = null;
+    try {
+      if (command === "update_index_configuration") {
+        await invoke(command, {
+          roots: indexRootsText.split("\n").map((path) => path.trim()).filter(Boolean),
+          exclusions: indexExclusionsText.split("\n").map((path) => path.trim()).filter(Boolean),
+        });
+      } else {
+        await invoke(command);
+        if (command === "reset_index_configuration") await loadIndexConfiguration();
+      }
+      await refreshCatalogStatus();
+      if (catalogStatus?.phase === "scanning") await monitorCatalogStatus();
+      if (catalogStatus?.phase === "error") {
+        indexSettingsError = catalogStatus.message ?? "Catalog refresh failed";
+      }
+      if (query.trim()) await loadResults(query);
+    } catch (error) {
+      console.error("failed to update index settings", error);
+      indexSettingsError = typeof error === "string" ? error : "Could not update index settings";
+    } finally {
+      isIndexBusy = false;
     }
   }
 
@@ -646,14 +738,18 @@
     focusSearchInput();
   }
 
-  function recordSearchHistory(queryBeforeAction: string) {
+  async function recordSearchHistory(queryBeforeAction: string): Promise<boolean> {
     if (!queryBeforeAction.trim()) {
-      return;
+      return true;
     }
 
-    void invoke("record_search_history", { query: queryBeforeAction }).catch((error) => {
+    try {
+      await invoke("record_search_history", { query: queryBeforeAction });
+      return true;
+    } catch (error) {
       console.error("failed to record search history", error);
-    });
+      return false;
+    }
   }
 
   function removeResultById(resultId: string) {
@@ -799,13 +895,19 @@
         }
       }
 
-      recordSearchHistory(queryBeforeAction);
+      const historyRecorded = await recordSearchHistory(queryBeforeAction);
+      if (!historyRecorded) {
+        actionError = "Action completed, but search history could not be saved";
+        focusSearchInput();
+        return;
+      }
       query = "";
       results = [];
       selectedIndex = -1;
       searchError = null;
       actionError = null;
       await resetToNativeCompact();
+      await invoke("close_launcher");
     } catch (error) {
       console.error("failed to run selected action", error);
       actionError = actionFailureMessage(action);
@@ -825,6 +927,9 @@
 
     void invoke("frontend_ready").catch((error) => {
       console.error("failed to report frontend readiness", error);
+    });
+    void refreshCatalogStatus().then(() => {
+      if (catalogStatus?.phase === "scanning") void monitorCatalogStatus();
     });
 
     let disposed = false;
@@ -849,6 +954,7 @@
       });
 
     void listen("launcher:catalog-ready", () => {
+      void refreshCatalogStatus();
       if (query.trim().length > 0) {
         void loadResults(query);
       }
@@ -863,6 +969,24 @@
       })
       .catch((error) => {
         console.error("failed to listen for launcher catalog event", error);
+      });
+
+    void listen<CatalogStatus>("launcher:catalog-status", (event) => {
+      catalogStatus = event.payload;
+      if (catalogStatus.phase === "ready" && query.trim().length > 0) {
+        void loadResults(query);
+      }
+    })
+      .then((unlistenListener) => {
+        if (disposed) {
+          unlistenListener();
+          return;
+        }
+
+        unlisteners.push(unlistenListener);
+      })
+      .catch((error) => {
+        console.error("failed to listen for launcher catalog status", error);
       });
 
     return () => {
@@ -969,7 +1093,48 @@
       >
         <span class="symbolic-icon symbolic-clipboard"></span>
       </button>
+      <button
+        class:active={isIndexPanelOpen}
+        class="privacy-toggle"
+        type="button"
+        aria-label="Search index settings"
+        onclick={toggleIndexPanel}
+      >
+        <span aria-hidden="true">⚙</span>
+      </button>
     </div>
+
+    {#if isIndexPanelOpen}
+      <div class="index-panel" role="dialog" aria-label="Search index settings">
+        <div class="index-panel-header">
+          <strong>Search index</strong>
+          <span>{catalogStatus?.phase === "scanning" ? "Refreshing…" : catalogStatus?.phase === "error" ? "Error" : "Ready"}</span>
+        </div>
+        <div class="catalog-counts">
+          <span>{catalogStatus?.app_count ?? 0} apps</span>
+          <span>{catalogStatus?.file_count ?? 0} files</span>
+          {#if catalogStatus?.updated_at_ms}
+            <span>Updated {new Date(catalogStatus.updated_at_ms).toLocaleTimeString()}</span>
+          {/if}
+        </div>
+        <label class="index-field">
+          <span>Folders to index (one absolute path per line)</span>
+          <textarea bind:value={indexRootsText} spellcheck="false"></textarea>
+        </label>
+        <label class="index-field">
+          <span>Excluded folders (one absolute path per line)</span>
+          <textarea bind:value={indexExclusionsText} spellcheck="false"></textarea>
+        </label>
+        {#if indexSettingsError}
+          <div class="privacy-panel-note" role="alert">{indexSettingsError}</div>
+        {/if}
+        <div class="privacy-panel-actions">
+          <button type="button" disabled={isIndexBusy} onclick={() => runIndexCommand("reset_index_configuration")}>Reset</button>
+          <button type="button" disabled={isIndexBusy} onclick={() => runIndexCommand("refresh_catalogs")}>Refresh</button>
+          <button type="button" disabled={isIndexBusy} onclick={() => runIndexCommand("update_index_configuration")}>Save and refresh</button>
+        </div>
+      </div>
+    {/if}
 
     {#if isPrivacyPanelOpen}
       <div class="privacy-panel" role="dialog" aria-label="Clipboard privacy">
@@ -1254,6 +1419,54 @@
     border-radius: 10px;
     background: rgba(250, 251, 252, 0.98);
     box-shadow: 0 10px 24px rgba(0, 0, 0, 0.16);
+  }
+
+  .index-panel {
+    position: absolute;
+    z-index: 4;
+    top: 70px;
+    right: 12px;
+    left: 12px;
+    max-height: calc(100% - 82px);
+    padding: 12px;
+    overflow: auto;
+    border: 1px solid rgba(58, 60, 67, 0.12);
+    border-radius: 10px;
+    background: rgba(250, 251, 252, 0.98);
+    box-shadow: 0 10px 24px rgba(0, 0, 0, 0.16);
+  }
+
+  .index-panel-header,
+  .catalog-counts {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+
+  .index-panel-header { font-size: 13px; }
+  .index-panel-header span,
+  .catalog-counts { color: rgba(58, 60, 67, 0.66); font-size: 11px; }
+  .catalog-counts { justify-content: flex-start; margin-top: 5px; }
+
+  .index-field {
+    display: grid;
+    gap: 4px;
+    margin-top: 10px;
+    color: rgba(58, 60, 67, 0.76);
+    font-size: 11px;
+  }
+
+  .index-field textarea {
+    width: 100%;
+    min-height: 54px;
+    resize: vertical;
+    padding: 6px 8px;
+    border: 1px solid rgba(58, 60, 67, 0.18);
+    border-radius: 7px;
+    color: rgba(18, 18, 20, 0.9);
+    background: white;
+    font: 11px/1.35 ui-monospace, SFMono-Regular, monospace;
   }
 
   .privacy-panel-header,

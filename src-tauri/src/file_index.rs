@@ -52,16 +52,41 @@ pub(crate) fn scan_default_roots() -> FileIndex {
 }
 
 pub(crate) fn scan_roots(roots: &[PathBuf]) -> FileIndex {
+    scan_roots_with_exclusions(roots, &[])
+}
+
+pub(crate) fn scan_roots_with_exclusions(roots: &[PathBuf], exclusions: &[PathBuf]) -> FileIndex {
     let mut records = Vec::new();
 
-    for root in roots {
-        scan_path(root, &mut records);
+    let mut ordered_roots = roots.to_vec();
+    ordered_roots.sort_by(|left, right| {
+        left.components()
+            .count()
+            .cmp(&right.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    let mut deduplicated_roots = Vec::new();
+    for root in ordered_roots {
+        if !deduplicated_roots
+            .iter()
+            .any(|parent: &PathBuf| root.starts_with(parent))
+        {
+            deduplicated_roots.push(root);
+        }
+    }
+
+    for root in deduplicated_roots {
+        scan_path(&root, exclusions, &mut records);
     }
 
     FileIndex::from_records(records)
 }
 
-fn scan_path(path: &Path, records: &mut Vec<FileRecord>) {
+fn scan_path(path: &Path, exclusions: &[PathBuf], records: &mut Vec<FileRecord>) {
+    if exclusions.iter().any(|excluded| path.starts_with(excluded)) {
+        return;
+    }
+
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return;
     };
@@ -97,7 +122,7 @@ fn scan_path(path: &Path, records: &mut Vec<FileRecord>) {
             continue;
         }
 
-        scan_path(&child_path, records);
+        scan_path(&child_path, exclusions, records);
     }
 }
 
@@ -397,6 +422,47 @@ mod tests {
 
         let index = scan_roots(&[missing]);
 
+        assert!(index.is_empty());
+
+        fs::remove_dir_all(home).expect("temporary home should be removed");
+    }
+
+    #[test]
+    fn scan_honors_excluded_subtrees_and_overlapping_roots_without_duplicates() {
+        let home = temporary_home("scan-exclusions-overlaps");
+        let root = home.join("Projects");
+        let nested = root.join("app");
+        let excluded = nested.join("target");
+        fs::create_dir_all(&excluded).expect("excluded directory should be created");
+        fs::write(nested.join("README.md"), "readme").expect("included file should be created");
+        fs::write(excluded.join("artifact"), "generated").expect("excluded file should be created");
+
+        let index = scan_roots_with_exclusions(
+            &[nested.clone(), root.clone()],
+            std::slice::from_ref(&excluded),
+        );
+        let paths = index
+            .records()
+            .iter()
+            .map(|record| record.path.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            paths,
+            [root.clone(), nested.clone(), nested.join("README.md")]
+        );
+
+        fs::remove_dir_all(home).expect("temporary home should be removed");
+    }
+
+    #[test]
+    fn scan_can_exclude_an_entire_configured_root() {
+        let home = temporary_home("scan-excluded-root");
+        let root = home.join("Documents");
+        fs::create_dir_all(&root).expect("root should be created");
+        fs::write(root.join("note.txt"), "note").expect("file should be created");
+
+        let index = scan_roots_with_exclusions(&[root.clone()], &[root]);
         assert!(index.is_empty());
 
         fs::remove_dir_all(home).expect("temporary home should be removed");

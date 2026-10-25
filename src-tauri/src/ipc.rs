@@ -13,7 +13,10 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{app_launch::LaunchResult, search_result::SearchResult};
+use crate::{
+    app_launch::LaunchResult, search_result::SearchResult, CatalogStatus, ClipboardPrivacyStatus,
+    IndexConfigurationView,
+};
 
 const SOCKET_FILE_NAME: &str = "rat-search.sock";
 const FALLBACK_SOCKET_PREFIX: &str = "rat-search";
@@ -65,16 +68,45 @@ pub(crate) enum IpcRequest {
     DeleteClipboardItem {
         item_id: String,
     },
+    EnableClipboardHistory,
+    DisableClipboardHistory,
+    ClearClipboardHistory,
+    GetClipboardPrivacyStatus,
+    RefreshCatalogs,
+    GetCatalogStatus,
+    GetIndexConfiguration,
+    ResetIndexConfiguration,
+    UpdateIndexConfiguration {
+        roots: Vec<String>,
+        exclusions: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum IpcResponse {
-    Health { ready: bool },
-    Search { results: Vec<SearchResult> },
-    LaunchApp { result: LaunchResult },
+    Health {
+        ready: bool,
+    },
+    Search {
+        results: Vec<SearchResult>,
+    },
+    LaunchApp {
+        result: LaunchResult,
+    },
+    ClipboardPrivacyStatus {
+        status: ClipboardPrivacyStatus,
+    },
+    CatalogStatus {
+        status: CatalogStatus,
+    },
+    IndexConfiguration {
+        configuration: IndexConfigurationView,
+    },
     Unit,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 pub(crate) fn socket_path() -> PathBuf {
@@ -268,6 +300,35 @@ mod tests {
 
         assert_eq!(
             serde_json::from_str::<IpcResponse>(&value).expect("response should deserialize"),
+            response
+        );
+    }
+
+    #[test]
+    fn index_configuration_and_catalog_status_ipc_round_trip() {
+        let request = IpcRequest::UpdateIndexConfiguration {
+            roots: vec!["/home/user/Projects".to_owned()],
+            exclusions: vec!["/home/user/Projects/target".to_owned()],
+        };
+        let request_json = serde_json::to_string(&request).expect("request should serialize");
+        assert_eq!(
+            serde_json::from_str::<IpcRequest>(&request_json).expect("request should deserialize"),
+            request
+        );
+
+        let response = IpcResponse::CatalogStatus {
+            status: crate::CatalogStatus {
+                phase: crate::CatalogPhase::Ready,
+                app_count: 4,
+                file_count: 25,
+                updated_at_ms: Some(1_700),
+                message: None,
+            },
+        };
+        let response_json = serde_json::to_string(&response).expect("response should serialize");
+        assert_eq!(
+            serde_json::from_str::<IpcResponse>(&response_json)
+                .expect("response should deserialize"),
             response
         );
     }
