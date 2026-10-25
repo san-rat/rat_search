@@ -4,13 +4,13 @@ use std::{
     process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, OnceLock, RwLock,
+        Arc, Mutex, OnceLock, RwLock,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Size, WebviewWindow};
 
 mod app_discovery;
@@ -24,6 +24,7 @@ mod file_actions;
 mod file_icons;
 mod file_index;
 mod file_search;
+mod index_settings;
 mod ipc;
 mod search_history;
 mod search_result;
@@ -37,6 +38,7 @@ use clipboard_history::{ClipboardHistory, ClipboardRecordOutcome};
 use clipboard_settings::ClipboardSettings;
 use file_actions::{PreferredOpen, ValidatedPath};
 use file_index::FileIndex;
+use index_settings::IndexConfiguration;
 use ipc::{IpcRequest, IpcResponse};
 use search_history::SearchHistory;
 use search_result::{SearchAction, SearchResult, SearchSource};
@@ -49,8 +51,52 @@ type AppCatalogState = Arc<RwLock<AppCatalog>>;
 type ClipboardHistoryState = Arc<RwLock<ClipboardHistory>>;
 type ClipboardSettingsState = Arc<RwLock<ClipboardSettings>>;
 type SearchHistoryState = Arc<RwLock<SearchHistory>>;
+type IndexConfigurationState = Arc<RwLock<IndexConfiguration>>;
+type CatalogStatusState = Arc<RwLock<CatalogStatus>>;
+type CatalogRefreshControl = Arc<Mutex<RefreshControl>>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CatalogPhase {
+    Scanning,
+    Ready,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CatalogStatus {
+    phase: CatalogPhase,
+    app_count: usize,
+    file_count: usize,
+    updated_at_ms: Option<u64>,
+    message: Option<String>,
+}
+
+impl Default for CatalogStatus {
+    fn default() -> Self {
+        Self {
+            phase: CatalogPhase::Scanning,
+            app_count: 0,
+            file_count: 0,
+            updated_at_ms: None,
+            message: None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct RefreshControl {
+    busy: bool,
+    rerun_requested: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct IndexConfigurationView {
+    roots: Vec<String>,
+    exclusions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ClipboardPrivacyStatus {
     enabled: bool,
     entry_count: usize,
@@ -62,12 +108,14 @@ struct ClipboardPrivacyStatus {
 const LAUNCHER_WINDOW_LABEL: &str = "main";
 const LAUNCHER_SHOWN_EVENT: &str = "launcher:shown";
 const LAUNCHER_CATALOG_READY_EVENT: &str = "launcher:catalog-ready";
+const LAUNCHER_CATALOG_STATUS_EVENT: &str = "launcher:catalog-status";
 const TOGGLE_ARG: &str = "toggle";
 const FOREGROUND_ARG: &str = "foreground";
 const CLIPBOARD_HISTORY_FILE_NAME: &str = "clipboard-history.json";
 const CLIPBOARD_SETTINGS_FILE_NAME: &str = "clipboard-settings.json";
 const CLIPBOARD_POLL_INTERVAL_MS: u64 = 1_000;
 const SEARCH_HISTORY_FILE_NAME: &str = "search-history.json";
+const INDEX_SETTINGS_FILE_NAME: &str = "index-settings.json";
 const LAUNCHER_FOCUS_RETRY_MS: [u64; 4] = [50, 150, 300, 500];
 const LAUNCHER_VERTICAL_PERCENT: u32 = 25;
 const LAUNCHER_SEARCH_ROW_CENTER_OFFSET: i32 = 42;
@@ -764,6 +812,10 @@ fn clipboard_settings_file_path_from_data_dir(data_dir: &Path) -> PathBuf {
     data_dir.join(CLIPBOARD_SETTINGS_FILE_NAME)
 }
 
+fn index_configuration_file_path_from_data_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(INDEX_SETTINGS_FILE_NAME)
+}
+
 fn search_history_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_data_dir()
@@ -785,6 +837,13 @@ fn clipboard_settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| error.to_string())
 }
 
+fn index_configuration_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|data_dir| index_configuration_file_path_from_data_dir(&data_dir))
+        .map_err(|error| error.to_string())
+}
+
 fn fallback_search_history_path() -> PathBuf {
     std::env::temp_dir()
         .join("rat-search")
@@ -801,6 +860,30 @@ fn fallback_clipboard_settings_path() -> PathBuf {
     std::env::temp_dir()
         .join("rat-search")
         .join(CLIPBOARD_SETTINGS_FILE_NAME)
+}
+
+fn fallback_index_configuration_path() -> PathBuf {
+    std::env::temp_dir()
+        .join("rat-search")
+        .join(INDEX_SETTINGS_FILE_NAME)
+}
+
+fn user_home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+fn load_index_configuration_state(app: &tauri::AppHandle) -> IndexConfigurationState {
+    let config_path = index_configuration_path(app).unwrap_or_else(|error| {
+        eprintln!("failed to resolve index settings path: {error}");
+        fallback_index_configuration_path()
+    });
+    Arc::new(RwLock::new(IndexConfiguration::load(
+        config_path,
+        &user_home_dir(),
+    )))
 }
 
 fn load_search_history_state(app: &tauri::AppHandle) -> SearchHistoryState {
@@ -1258,9 +1341,175 @@ fn foreground_ipc_request(request: IpcRequest) -> Result<IpcResponse, String> {
     ipc::send_request(&request)
 }
 
-fn foreground_ipc_unit(app: &tauri::AppHandle, request: IpcRequest) -> Option<Result<(), String>> {
+fn resident_unit_request(request: IpcRequest) -> Result<(), String> {
+    match foreground_ipc_request(request)? {
+        IpcResponse::Unit => Ok(()),
+        IpcResponse::Error { message } => Err(message),
+        _ => Err("Unexpected resident response".to_owned()),
+    }
+}
+
+fn index_configuration_view_from_state(
+    configuration: &IndexConfigurationState,
+) -> Result<IndexConfigurationView, String> {
+    let configuration = configuration
+        .read()
+        .map_err(|_| "Index settings unavailable".to_owned())?;
+    Ok(IndexConfigurationView {
+        roots: configuration.roots_for_frontend(),
+        exclusions: configuration.exclusions_for_frontend(),
+    })
+}
+
+fn update_index_configuration_in_state(
+    state: &IndexConfigurationState,
+    roots: &[String],
+    exclusions: &[String],
+) -> Result<(), String> {
+    let path = state
+        .read()
+        .map_err(|_| "Index settings unavailable".to_owned())?
+        .path()
+        .to_path_buf();
+    let configuration = IndexConfiguration::validated(path, roots, exclusions, &user_home_dir())?;
+    configuration.save()?;
+    *state
+        .write()
+        .map_err(|_| "Index settings unavailable".to_owned())? = configuration;
+    Ok(())
+}
+
+fn reset_index_configuration_in_state(state: &IndexConfigurationState) -> Result<(), String> {
+    reset_index_configuration_in_state_with_home(state, &user_home_dir())
+}
+
+fn reset_index_configuration_in_state_with_home(
+    state: &IndexConfigurationState,
+    home: &Path,
+) -> Result<(), String> {
+    let (path, home) = {
+        let configuration = state
+            .read()
+            .map_err(|_| "Index settings unavailable".to_owned())?;
+        (configuration.path().to_path_buf(), home.to_path_buf())
+    };
+    let configuration = IndexConfiguration::defaults(path, &home);
+    configuration.save()?;
+    *state
+        .write()
+        .map_err(|_| "Index settings unavailable".to_owned())? = configuration;
+    Ok(())
+}
+
+#[tauri::command]
+fn refresh_catalogs(
+    app: tauri::AppHandle,
+    catalog: tauri::State<'_, AppCatalogState>,
+    file_index: tauri::State<'_, FileIndexState>,
+    configuration: tauri::State<'_, IndexConfigurationState>,
+    status: tauri::State<'_, CatalogStatusState>,
+    control: tauri::State<'_, CatalogRefreshControl>,
+) -> Result<(), String> {
+    if FOREGROUND_LAUNCHER_MODE.load(Ordering::Relaxed) {
+        return resident_unit_request(IpcRequest::RefreshCatalogs);
+    }
+
+    request_catalog_refresh(
+        app,
+        catalog.inner().clone(),
+        file_index.inner().clone(),
+        configuration.inner().clone(),
+        status.inner().clone(),
+        control.inner().clone(),
+    )
+}
+
+#[tauri::command]
+fn get_catalog_status(
+    status: tauri::State<'_, CatalogStatusState>,
+) -> Result<CatalogStatus, String> {
+    if FOREGROUND_LAUNCHER_MODE.load(Ordering::Relaxed) {
+        return match foreground_ipc_request(IpcRequest::GetCatalogStatus)? {
+            IpcResponse::CatalogStatus { status } => Ok(status),
+            IpcResponse::Error { message } => Err(message),
+            _ => Err("Unexpected resident response".to_owned()),
+        };
+    }
+
+    status
+        .read()
+        .map(|status| status.clone())
+        .map_err(|_| "Catalog status unavailable".to_owned())
+}
+
+#[tauri::command]
+fn get_index_configuration(
+    configuration: tauri::State<'_, IndexConfigurationState>,
+) -> Result<IndexConfigurationView, String> {
+    if FOREGROUND_LAUNCHER_MODE.load(Ordering::Relaxed) {
+        return match foreground_ipc_request(IpcRequest::GetIndexConfiguration)? {
+            IpcResponse::IndexConfiguration { configuration } => Ok(configuration),
+            IpcResponse::Error { message } => Err(message),
+            _ => Err("Unexpected resident response".to_owned()),
+        };
+    }
+
+    index_configuration_view_from_state(&configuration)
+}
+
+#[tauri::command]
+fn update_index_configuration(
+    app: tauri::AppHandle,
+    catalog: tauri::State<'_, AppCatalogState>,
+    file_index: tauri::State<'_, FileIndexState>,
+    configuration: tauri::State<'_, IndexConfigurationState>,
+    status: tauri::State<'_, CatalogStatusState>,
+    control: tauri::State<'_, CatalogRefreshControl>,
+    roots: Vec<String>,
+    exclusions: Vec<String>,
+) -> Result<(), String> {
+    if FOREGROUND_LAUNCHER_MODE.load(Ordering::Relaxed) {
+        return resident_unit_request(IpcRequest::UpdateIndexConfiguration { roots, exclusions });
+    }
+
+    update_index_configuration_in_state(&configuration, &roots, &exclusions)?;
+    request_catalog_refresh(
+        app,
+        catalog.inner().clone(),
+        file_index.inner().clone(),
+        configuration.inner().clone(),
+        status.inner().clone(),
+        control.inner().clone(),
+    )
+}
+
+#[tauri::command]
+fn reset_index_configuration(
+    app: tauri::AppHandle,
+    catalog: tauri::State<'_, AppCatalogState>,
+    file_index: tauri::State<'_, FileIndexState>,
+    configuration: tauri::State<'_, IndexConfigurationState>,
+    status: tauri::State<'_, CatalogStatusState>,
+    control: tauri::State<'_, CatalogRefreshControl>,
+) -> Result<(), String> {
+    if FOREGROUND_LAUNCHER_MODE.load(Ordering::Relaxed) {
+        return resident_unit_request(IpcRequest::ResetIndexConfiguration);
+    }
+
+    reset_index_configuration_in_state(&configuration)?;
+    request_catalog_refresh(
+        app,
+        catalog.inner().clone(),
+        file_index.inner().clone(),
+        configuration.inner().clone(),
+        status.inner().clone(),
+        control.inner().clone(),
+    )
+}
+
+fn foreground_ipc_unit(request: IpcRequest) -> Option<Result<(), String>> {
     match foreground_ipc_request(request) {
-        Ok(IpcResponse::Unit) => Some(hide_launcher_for_app(app)),
+        Ok(IpcResponse::Unit) => Some(Ok(())),
         Ok(IpcResponse::Error { message }) => Some(Err(message)),
         Ok(_) => Some(Err("Unexpected resident response".to_owned())),
         Err(error) => {
@@ -1285,12 +1534,11 @@ fn open_path(
     file_index: tauri::State<'_, FileIndexState>,
     path: String,
 ) -> Result<(), String> {
-    if let Some(result) = foreground_ipc_unit(&app, IpcRequest::OpenPath { path: path.clone() }) {
+    if let Some(result) = foreground_ipc_unit(IpcRequest::OpenPath { path: path.clone() }) {
         return result;
     }
 
-    open_path_action(&app, &file_index, &path)?;
-    hide_launcher_for_app(&app)
+    open_path_action(&app, &file_index, &path)
 }
 
 #[tauri::command]
@@ -1299,12 +1547,11 @@ fn open_in_code(
     file_index: tauri::State<'_, FileIndexState>,
     path: String,
 ) -> Result<(), String> {
-    if let Some(result) = foreground_ipc_unit(&app, IpcRequest::OpenInCode { path: path.clone() }) {
+    if let Some(result) = foreground_ipc_unit(IpcRequest::OpenInCode { path: path.clone() }) {
         return result;
     }
 
-    open_in_code_action(&app, &file_index, &path)?;
-    hide_launcher_for_app(&app)
+    open_in_code_action(&app, &file_index, &path)
 }
 
 #[tauri::command]
@@ -1313,12 +1560,11 @@ fn reveal_path(
     file_index: tauri::State<'_, FileIndexState>,
     path: String,
 ) -> Result<(), String> {
-    if let Some(result) = foreground_ipc_unit(&app, IpcRequest::RevealPath { path: path.clone() }) {
+    if let Some(result) = foreground_ipc_unit(IpcRequest::RevealPath { path: path.clone() }) {
         return result;
     }
 
-    reveal_path_action(&app, &file_index, &path)?;
-    hide_launcher_for_app(&app)
+    reveal_path_action(&app, &file_index, &path)
 }
 
 #[tauri::command]
@@ -1327,22 +1573,20 @@ fn copy_path(
     file_index: tauri::State<'_, FileIndexState>,
     path: String,
 ) -> Result<(), String> {
-    if let Some(result) = foreground_ipc_unit(&app, IpcRequest::CopyPath { path: path.clone() }) {
+    if let Some(result) = foreground_ipc_unit(IpcRequest::CopyPath { path: path.clone() }) {
         return result;
     }
 
-    copy_path_action(&app, &file_index, &path)?;
-    hide_launcher_for_app(&app)
+    copy_path_action(&app, &file_index, &path)
 }
 
 #[tauri::command]
 fn copy_text(app: tauri::AppHandle, text: String) -> Result<(), String> {
-    if let Some(result) = foreground_ipc_unit(&app, IpcRequest::CopyText { text: text.clone() }) {
+    if let Some(result) = foreground_ipc_unit(IpcRequest::CopyText { text: text.clone() }) {
         return result;
     }
 
-    copy_text_action(&app, &text)?;
-    hide_launcher_for_app(&app)
+    copy_text_action(&app, &text)
 }
 
 #[tauri::command]
@@ -1352,25 +1596,25 @@ fn open_calculator_app(
     result: String,
     copy_text: String,
 ) -> Result<(), String> {
-    if let Some(result) = foreground_ipc_unit(
-        &app,
-        IpcRequest::OpenCalculatorApp {
-            expression: expression.clone(),
-            result: result.clone(),
-            copy_text: copy_text.clone(),
-        },
-    ) {
+    if let Some(result) = foreground_ipc_unit(IpcRequest::OpenCalculatorApp {
+        expression: expression.clone(),
+        result: result.clone(),
+        copy_text: copy_text.clone(),
+    }) {
         return result;
     }
 
-    open_calculator_app_action(&app, &expression, &result, &copy_text)?;
-    hide_launcher_for_app(&app)
+    open_calculator_app_action(&app, &expression, &result, &copy_text)
 }
 
 #[tauri::command]
 fn enable_clipboard_history(
     settings: tauri::State<'_, ClipboardSettingsState>,
 ) -> Result<(), String> {
+    if FOREGROUND_LAUNCHER_MODE.load(Ordering::Relaxed) {
+        return resident_unit_request(IpcRequest::EnableClipboardHistory);
+    }
+
     set_clipboard_history_enabled_in_state(&settings, true, current_time_ms())
 }
 
@@ -1378,11 +1622,19 @@ fn enable_clipboard_history(
 fn disable_clipboard_history(
     settings: tauri::State<'_, ClipboardSettingsState>,
 ) -> Result<(), String> {
+    if FOREGROUND_LAUNCHER_MODE.load(Ordering::Relaxed) {
+        return resident_unit_request(IpcRequest::DisableClipboardHistory);
+    }
+
     set_clipboard_history_enabled_in_state(&settings, false, current_time_ms())
 }
 
 #[tauri::command]
 fn clear_clipboard_history(history: tauri::State<'_, ClipboardHistoryState>) -> Result<(), String> {
+    if FOREGROUND_LAUNCHER_MODE.load(Ordering::Relaxed) {
+        return resident_unit_request(IpcRequest::ClearClipboardHistory);
+    }
+
     clear_clipboard_history_in_state(&history)
 }
 
@@ -1413,17 +1665,13 @@ fn copy_clipboard_item(
     history: tauri::State<'_, ClipboardHistoryState>,
     item_id: String,
 ) -> Result<(), String> {
-    if let Some(result) = foreground_ipc_unit(
-        &app,
-        IpcRequest::CopyClipboardItem {
-            item_id: item_id.clone(),
-        },
-    ) {
+    if let Some(result) = foreground_ipc_unit(IpcRequest::CopyClipboardItem {
+        item_id: item_id.clone(),
+    }) {
         return result;
     }
 
-    copy_clipboard_item_action(&app, &history, &item_id)?;
-    hide_launcher_for_app(&app)
+    copy_clipboard_item_action(&app, &history, &item_id)
 }
 
 #[tauri::command]
@@ -1431,32 +1679,35 @@ fn get_clipboard_privacy_status(
     settings: tauri::State<'_, ClipboardSettingsState>,
     history: tauri::State<'_, ClipboardHistoryState>,
 ) -> Result<ClipboardPrivacyStatus, String> {
+    if FOREGROUND_LAUNCHER_MODE.load(Ordering::Relaxed) {
+        return match foreground_ipc_request(IpcRequest::GetClipboardPrivacyStatus)? {
+            IpcResponse::ClipboardPrivacyStatus { status } => Ok(status),
+            IpcResponse::Error { message } => Err(message),
+            _ => Err("Unexpected resident response".to_owned()),
+        };
+    }
+
     clipboard_privacy_status_from_state(&settings, &history)
 }
 
 #[tauri::command]
 fn open_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
-    if let Some(result) = foreground_ipc_unit(&app, IpcRequest::OpenUrl { url: url.clone() }) {
+    if let Some(result) = foreground_ipc_unit(IpcRequest::OpenUrl { url: url.clone() }) {
         return result;
     }
 
-    open_url_action(&app, &url)?;
-    hide_launcher_for_app(&app)
+    open_url_action(&app, &url)
 }
 
 #[tauri::command]
-fn open_setting(app: tauri::AppHandle, setting_id: String) -> Result<(), String> {
-    if let Some(result) = foreground_ipc_unit(
-        &app,
-        IpcRequest::OpenSetting {
-            setting_id: setting_id.clone(),
-        },
-    ) {
+fn open_setting(setting_id: String) -> Result<(), String> {
+    if let Some(result) = foreground_ipc_unit(IpcRequest::OpenSetting {
+        setting_id: setting_id.clone(),
+    }) {
         return result;
     }
 
-    open_setting_action(&setting_id)?;
-    hide_launcher_for_app(&app)
+    open_setting_action(&setting_id)
 }
 
 #[tauri::command]
@@ -1480,53 +1731,161 @@ fn record_search_history(
     record_search_history_in_state(&history, &query, current_time_ms())
 }
 
-fn start_app_catalog_scan(app_catalog: AppCatalogState, app_handle: Option<tauri::AppHandle>) {
-    thread::spawn(move || {
-        let scanned_catalog = AppCatalog::scan();
-        let scanned_count = scanned_catalog.len();
-
-        match app_catalog.write() {
-            Ok(mut catalog) => {
-                *catalog = scanned_catalog;
-                dev_log(format!(
-                    "app catalog scan: stored {scanned_count} application records"
-                ));
-                if let Some(app_handle) = app_handle {
-                    if let Err(error) = app_handle.emit(LAUNCHER_CATALOG_READY_EVENT, ()) {
-                        eprintln!("failed to emit {LAUNCHER_CATALOG_READY_EVENT}: {error}");
-                    }
-                }
-            }
-            Err(error) => {
-                eprintln!("failed to store app catalog scan results: {error}");
-            }
+fn emit_catalog_status(app: &tauri::AppHandle, status: &CatalogStatus) {
+    if let Err(error) = app.emit(LAUNCHER_CATALOG_STATUS_EVENT, status) {
+        eprintln!("failed to emit {LAUNCHER_CATALOG_STATUS_EVENT}: {error}");
+    }
+    if status.phase == CatalogPhase::Ready {
+        if let Err(error) = app.emit(LAUNCHER_CATALOG_READY_EVENT, ()) {
+            eprintln!("failed to emit {LAUNCHER_CATALOG_READY_EVENT}: {error}");
         }
-    });
+    }
 }
 
-fn start_file_index_scan(file_index: FileIndexState) {
-    thread::spawn(move || {
-        let roots = file_index::default_index_roots();
-        dev_log(format!(
-            "file index scan: discovered {} default roots",
-            roots.len()
-        ));
+fn request_catalog_refresh(
+    app: tauri::AppHandle,
+    app_catalog: AppCatalogState,
+    file_index: FileIndexState,
+    configuration: IndexConfigurationState,
+    status: CatalogStatusState,
+    control: CatalogRefreshControl,
+) -> Result<(), String> {
+    if !begin_catalog_refresh(&control)? {
+        return Ok(());
+    }
 
-        let scanned_index = file_index::scan_roots(&roots);
-        let scanned_count = scanned_index.len();
+    let previous_status = status.read().ok().map(|current| current.clone());
+    let scanning_status = CatalogStatus {
+        phase: CatalogPhase::Scanning,
+        app_count: previous_status
+            .as_ref()
+            .map_or(0, |current| current.app_count),
+        file_count: previous_status
+            .as_ref()
+            .map_or(0, |current| current.file_count),
+        updated_at_ms: previous_status.and_then(|current| current.updated_at_ms),
+        message: None,
+    };
+    if let Ok(mut current) = status.write() {
+        *current = scanning_status.clone();
+    }
+    emit_catalog_status(&app, &scanning_status);
 
-        match file_index.write() {
-            Ok(mut index) => {
-                *index = scanned_index;
-                dev_log(format!(
-                    "file index scan: stored {scanned_count} file/folder records"
-                ));
+    thread::spawn(move || loop {
+        let config = match configuration.read() {
+            Ok(config) => config.clone(),
+            Err(_) => {
+                finish_catalog_refresh_error(&app, &status, &control, "Index settings unavailable");
+                break;
             }
-            Err(error) => {
-                eprintln!("failed to store file index scan results: {error}");
-            }
+        };
+
+        let scanned_catalog = AppCatalog::scan();
+        let scanned_index =
+            file_index::scan_roots_with_exclusions(config.roots(), config.exclusions());
+        let app_count = scanned_catalog.len();
+        let file_count = scanned_index.len();
+
+        let catalog_stored = app_catalog.write().map(|mut catalog| {
+            *catalog = scanned_catalog;
+        });
+        let index_stored = file_index.write().map(|mut index| {
+            *index = scanned_index;
+        });
+        if catalog_stored.is_err() || index_stored.is_err() {
+            finish_catalog_refresh_error(
+                &app,
+                &status,
+                &control,
+                "Could not update search catalogs",
+            );
+            break;
         }
+
+        let ready_status = CatalogStatus {
+            phase: CatalogPhase::Ready,
+            app_count,
+            file_count,
+            updated_at_ms: Some(current_time_ms()),
+            message: None,
+        };
+        if let Ok(mut current) = status.write() {
+            *current = ready_status.clone();
+        }
+        emit_catalog_status(&app, &ready_status);
+
+        let rerun = finish_catalog_refresh_cycle(&control).unwrap_or(false);
+        if !rerun {
+            break;
+        }
+
+        let scanning_status = CatalogStatus {
+            phase: CatalogPhase::Scanning,
+            app_count,
+            file_count,
+            updated_at_ms: ready_status.updated_at_ms,
+            message: None,
+        };
+        if let Ok(mut current) = status.write() {
+            *current = scanning_status.clone();
+        }
+        emit_catalog_status(&app, &scanning_status);
     });
+
+    Ok(())
+}
+
+fn begin_catalog_refresh(control: &CatalogRefreshControl) -> Result<bool, String> {
+    let mut control = control
+        .lock()
+        .map_err(|_| "Catalog refresh unavailable".to_owned())?;
+    if control.busy {
+        control.rerun_requested = true;
+        return Ok(false);
+    }
+    control.busy = true;
+    Ok(true)
+}
+
+fn finish_catalog_refresh_cycle(control: &CatalogRefreshControl) -> Result<bool, String> {
+    let mut control = control
+        .lock()
+        .map_err(|_| "Catalog refresh unavailable".to_owned())?;
+    if control.rerun_requested {
+        control.rerun_requested = false;
+        Ok(true)
+    } else {
+        control.busy = false;
+        Ok(false)
+    }
+}
+
+fn finish_catalog_refresh_error(
+    app: &tauri::AppHandle,
+    status: &CatalogStatusState,
+    control: &CatalogRefreshControl,
+    message: &str,
+) {
+    let previous_status = status.read().ok().map(|current| current.clone());
+    let error_status = CatalogStatus {
+        phase: CatalogPhase::Error,
+        app_count: previous_status
+            .as_ref()
+            .map_or(0, |current| current.app_count),
+        file_count: previous_status
+            .as_ref()
+            .map_or(0, |current| current.file_count),
+        updated_at_ms: previous_status.and_then(|current| current.updated_at_ms),
+        message: Some(message.to_owned()),
+    };
+    if let Ok(mut current) = status.write() {
+        *current = error_status.clone();
+    }
+    emit_catalog_status(app, &error_status);
+    if let Ok(mut control) = control.lock() {
+        control.busy = false;
+        control.rerun_requested = false;
+    }
 }
 
 fn start_resident_ipc_server(
@@ -1536,6 +1895,9 @@ fn start_resident_ipc_server(
     clipboard_settings: ClipboardSettingsState,
     clipboard_history: ClipboardHistoryState,
     search_history: SearchHistoryState,
+    index_configuration: IndexConfigurationState,
+    catalog_status: CatalogStatusState,
+    catalog_control: CatalogRefreshControl,
 ) {
     match ipc::start_server(move |request| {
         handle_resident_ipc_request(
@@ -1545,6 +1907,9 @@ fn start_resident_ipc_server(
             &clipboard_settings,
             &clipboard_history,
             &search_history,
+            &index_configuration,
+            &catalog_status,
+            &catalog_control,
             request,
         )
     }) {
@@ -1560,6 +1925,9 @@ fn handle_resident_ipc_request(
     clipboard_settings: &ClipboardSettingsState,
     clipboard_history: &ClipboardHistoryState,
     search_history: &SearchHistoryState,
+    index_configuration: &IndexConfigurationState,
+    catalog_status: &CatalogStatusState,
+    catalog_control: &CatalogRefreshControl,
     request: IpcRequest,
 ) -> IpcResponse {
     match request {
@@ -1620,6 +1988,87 @@ fn handle_resident_ipc_request(
         IpcRequest::DeleteClipboardItem { item_id } => {
             unit_response(delete_clipboard_item_in_state(clipboard_history, &item_id))
         }
+        IpcRequest::EnableClipboardHistory
+        | IpcRequest::DisableClipboardHistory
+        | IpcRequest::ClearClipboardHistory
+        | IpcRequest::GetClipboardPrivacyStatus => {
+            handle_clipboard_control_request(request, clipboard_settings, clipboard_history)
+        }
+        IpcRequest::RefreshCatalogs => unit_response(request_catalog_refresh(
+            app.clone(),
+            catalog.clone(),
+            file_index.clone(),
+            index_configuration.clone(),
+            catalog_status.clone(),
+            catalog_control.clone(),
+        )),
+        IpcRequest::GetCatalogStatus => match catalog_status.read() {
+            Ok(status) => IpcResponse::CatalogStatus {
+                status: status.clone(),
+            },
+            Err(_) => IpcResponse::Error {
+                message: "Catalog status unavailable".to_owned(),
+            },
+        },
+        IpcRequest::GetIndexConfiguration => {
+            match index_configuration_view_from_state(index_configuration) {
+                Ok(configuration) => IpcResponse::IndexConfiguration { configuration },
+                Err(message) => IpcResponse::Error { message },
+            }
+        }
+        IpcRequest::UpdateIndexConfiguration { roots, exclusions } => {
+            match update_index_configuration_in_state(index_configuration, &roots, &exclusions) {
+                Ok(()) => unit_response(request_catalog_refresh(
+                    app.clone(),
+                    catalog.clone(),
+                    file_index.clone(),
+                    index_configuration.clone(),
+                    catalog_status.clone(),
+                    catalog_control.clone(),
+                )),
+                Err(message) => IpcResponse::Error { message },
+            }
+        }
+        IpcRequest::ResetIndexConfiguration => {
+            match reset_index_configuration_in_state(index_configuration) {
+                Ok(()) => unit_response(request_catalog_refresh(
+                    app.clone(),
+                    catalog.clone(),
+                    file_index.clone(),
+                    index_configuration.clone(),
+                    catalog_status.clone(),
+                    catalog_control.clone(),
+                )),
+                Err(message) => IpcResponse::Error { message },
+            }
+        }
+    }
+}
+
+fn handle_clipboard_control_request(
+    request: IpcRequest,
+    settings: &ClipboardSettingsState,
+    history: &ClipboardHistoryState,
+) -> IpcResponse {
+    match request {
+        IpcRequest::EnableClipboardHistory => unit_response(
+            set_clipboard_history_enabled_in_state(settings, true, current_time_ms()),
+        ),
+        IpcRequest::DisableClipboardHistory => unit_response(
+            set_clipboard_history_enabled_in_state(settings, false, current_time_ms()),
+        ),
+        IpcRequest::ClearClipboardHistory => {
+            unit_response(clear_clipboard_history_in_state(history))
+        }
+        IpcRequest::GetClipboardPrivacyStatus => {
+            match clipboard_privacy_status_from_state(settings, history) {
+                Ok(status) => IpcResponse::ClipboardPrivacyStatus { status },
+                Err(message) => IpcResponse::Error { message },
+            }
+        }
+        _ => IpcResponse::Error {
+            message: "Unexpected clipboard request".to_owned(),
+        },
     }
 }
 
@@ -1821,7 +2270,6 @@ fn set_launcher_expanded(app: tauri::AppHandle, expanded: bool) -> Result<(), St
 
 #[tauri::command]
 fn launch_app(
-    app: tauri::AppHandle,
     catalog: tauri::State<'_, AppCatalogState>,
     app_id: String,
 ) -> Result<LaunchResult, String> {
@@ -1830,7 +2278,6 @@ fn launch_app(
             app_id: app_id.clone(),
         }) {
             Ok(IpcResponse::LaunchApp { result }) => {
-                hide_launcher_for_app(&app)?;
                 return Ok(result);
             }
             Ok(IpcResponse::Error { message }) => return Err(message),
@@ -1842,7 +2289,6 @@ fn launch_app(
     }
 
     let result = launch_app_action(&catalog, &app_id)?;
-    hide_launcher_for_app(&app)?;
 
     Ok(result)
 }
@@ -1889,6 +2335,8 @@ pub fn run() {
             enable_clipboard_history,
             frontend_ready,
             get_clipboard_privacy_status,
+            get_catalog_status,
+            get_index_configuration,
             hide_launcher,
             launch_app,
             open_in_code,
@@ -1897,9 +2345,12 @@ pub fn run() {
             open_setting,
             open_url,
             record_search_history,
+            refresh_catalogs,
+            reset_index_configuration,
             reveal_path,
             search,
-            set_launcher_expanded
+            set_launcher_expanded,
+            update_index_configuration
         ])
         .setup(move |app| {
             timing_log("setup start");
@@ -1907,19 +2358,7 @@ pub fn run() {
             migrate_gnome_hotkey_command_if_needed();
             let resident_ready = foreground_mode && resident_ipc_ready();
 
-            let app_catalog = if foreground_mode {
-                if resident_ready {
-                    dev_log("foreground mode: resident IPC ready; app catalog scan skipped");
-                } else {
-                    dev_log("foreground mode: resident IPC unavailable; app catalog scan deferred");
-                }
-                Arc::new(RwLock::new(AppCatalog::default()))
-            } else {
-                let app_catalog = AppCatalog::scan();
-                let app_count = app_catalog.len();
-                dev_log(format!("discovered {app_count} applications"));
-                Arc::new(RwLock::new(app_catalog))
-            };
+            let app_catalog = Arc::new(RwLock::new(AppCatalog::default()));
             dev_log(format!(
                 "defaults: hotkey={}, max_results={}, compact_window={}x{}, expanded_window={}x{}, theme={}, search_source={}",
                 settings::DEFAULT_HOTKEY_LABEL,
@@ -1932,10 +2371,6 @@ pub fn run() {
                 settings::DEFAULT_SEARCH_SOURCE
             ));
             app.manage(app_catalog.clone());
-
-            if foreground_mode && !resident_ready {
-                start_app_catalog_scan(app_catalog.clone(), Some(app.handle().clone()));
-            }
 
             let search_history = load_search_history_state(app.handle());
             app.manage(search_history.clone());
@@ -1960,12 +2395,12 @@ pub fn run() {
 
             let file_index = Arc::new(RwLock::new(FileIndex::new()));
             app.manage(file_index.clone());
-
-            if foreground_mode {
-                dev_log("foreground mode: file index scan skipped");
-            } else {
-                start_file_index_scan(file_index.clone());
-            }
+            let index_configuration = load_index_configuration_state(app.handle());
+            app.manage(index_configuration.clone());
+            let catalog_status = Arc::new(RwLock::new(CatalogStatus::default()));
+            app.manage(catalog_status.clone());
+            let catalog_control = Arc::new(Mutex::new(RefreshControl::default()));
+            app.manage(catalog_control.clone());
 
             if !foreground_mode {
                 start_resident_ipc_server(
@@ -1975,7 +2410,21 @@ pub fn run() {
                     clipboard_settings.clone(),
                     clipboard_history.clone(),
                     search_history.clone(),
+                    index_configuration.clone(),
+                    catalog_status.clone(),
+                    catalog_control.clone(),
                 );
+            }
+
+            if !foreground_mode || !resident_ready {
+                request_catalog_refresh(
+                    app.handle().clone(),
+                    app_catalog.clone(),
+                    file_index.clone(),
+                    index_configuration.clone(),
+                    catalog_status.clone(),
+                    catalog_control.clone(),
+                )?;
             }
 
             if let Some(window) = app.get_webview_window(LAUNCHER_WINDOW_LABEL) {
@@ -2326,6 +2775,167 @@ mod tests {
         assert_eq!(disabled_file["updated_at_ms"], 3_000);
 
         fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn clipboard_control_ipc_mutates_resident_state_and_returns_authoritative_status() {
+        let settings_root = temporary_directory("clipboard-ipc-settings");
+        let history_root = temporary_directory("clipboard-ipc-history");
+        let settings =
+            clipboard_settings_state(settings_root.join("clipboard-settings.json"), false);
+        let history_path = history_root.join("clipboard-history.json");
+        let history = clipboard_history_state(history_path.clone());
+
+        assert_eq!(
+            handle_clipboard_control_request(
+                IpcRequest::EnableClipboardHistory,
+                &settings,
+                &history
+            ),
+            IpcResponse::Unit
+        );
+        assert!(
+            ClipboardSettings::load(settings_root.join("clipboard-settings.json")).is_enabled()
+        );
+
+        record_clipboard_text_in_state(&settings, &history, "resident-owned item", 1_700)
+            .expect("enabled resident should record clipboard text");
+        let status = handle_clipboard_control_request(
+            IpcRequest::GetClipboardPrivacyStatus,
+            &settings,
+            &history,
+        );
+        let IpcResponse::ClipboardPrivacyStatus { status } = status else {
+            panic!("status request should return resident status");
+        };
+        assert!(status.enabled);
+        assert_eq!(status.entry_count, 1);
+
+        assert_eq!(
+            handle_clipboard_control_request(
+                IpcRequest::DisableClipboardHistory,
+                &settings,
+                &history
+            ),
+            IpcResponse::Unit
+        );
+        assert!(
+            !ClipboardSettings::load(settings_root.join("clipboard-settings.json")).is_enabled()
+        );
+        assert_eq!(
+            record_clipboard_text_in_state(&settings, &history, "after disable", 1_800)
+                .expect("disabled capture should be ignored"),
+            ClipboardRecordOutcome::IgnoredDisabled
+        );
+
+        assert_eq!(
+            handle_clipboard_control_request(
+                IpcRequest::ClearClipboardHistory,
+                &settings,
+                &history
+            ),
+            IpcResponse::Unit
+        );
+        assert!(ClipboardHistory::load(history_path.clone())
+            .entries()
+            .is_empty());
+        assert_eq!(
+            clipboard_privacy_status_from_state(&settings, &history)
+                .expect("status should remain available")
+                .entry_count,
+            0
+        );
+
+        fs::remove_dir_all(settings_root).expect("temporary directory should be removed");
+        fs::remove_dir_all(history_root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn catalog_refresh_requests_coalesce_into_one_follow_up_scan() {
+        let control = Arc::new(Mutex::new(RefreshControl::default()));
+
+        assert!(begin_catalog_refresh(&control).expect("first refresh should start"));
+        assert!(!begin_catalog_refresh(&control).expect("second refresh should coalesce"));
+        assert!(!begin_catalog_refresh(&control).expect("extra refreshes should coalesce"));
+        assert!(finish_catalog_refresh_cycle(&control).expect("queued refresh should run"));
+        assert!(!finish_catalog_refresh_cycle(&control).expect("control should become idle"));
+        assert!(!control.lock().expect("control lock").busy);
+    }
+
+    #[test]
+    fn reset_index_configuration_persists_existing_default_roots() {
+        let home = temporary_directory("index-reset");
+        fs::create_dir_all(home.join("Documents")).expect("default root should exist");
+        fs::create_dir_all(home.join("Downloads")).expect("default root should exist");
+        let config_path = home.join("index-settings.json");
+        let custom = IndexConfiguration::validated(
+            config_path.clone(),
+            &[home.join("custom").to_string_lossy().into_owned()],
+            &[home.join("custom/private").to_string_lossy().into_owned()],
+            &home,
+        )
+        .expect("custom config should validate");
+        custom.save().expect("custom config should persist");
+        let state = Arc::new(RwLock::new(custom));
+
+        reset_index_configuration_in_state_with_home(&state, &home)
+            .expect("default config should persist");
+
+        let persisted = IndexConfiguration::load(config_path, &home);
+        assert_eq!(
+            persisted.roots(),
+            &[home.join("Documents"), home.join("Downloads")]
+        );
+        assert!(persisted.exclusions().is_empty());
+        fs::remove_dir_all(home).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn index_configuration_update_persists_and_rejects_invalid_replacement() {
+        let home = temporary_directory("index-update");
+        let config_path = home.join("index-settings.json");
+        let initial = IndexConfiguration::validated(
+            config_path.clone(),
+            &[home.join("initial").to_string_lossy().into_owned()],
+            &[],
+            &home,
+        )
+        .expect("initial config should validate");
+        let state = Arc::new(RwLock::new(initial));
+        let requested_root = home.join("Projects").to_string_lossy().into_owned();
+
+        update_index_configuration_in_state(&state, std::slice::from_ref(&requested_root), &[])
+            .expect("valid replacement should persist");
+        assert_eq!(
+            IndexConfiguration::load(config_path.clone(), &home).roots(),
+            &[home.join("Projects")]
+        );
+
+        assert!(
+            update_index_configuration_in_state(&state, &["relative".to_owned()], &[]).is_err()
+        );
+        assert_eq!(
+            state.read().expect("config lock").roots(),
+            &[home.join("Projects")]
+        );
+        fs::remove_dir_all(home).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn catalog_status_serializes_phase_counts_and_error_message_for_frontend() {
+        let status = CatalogStatus {
+            phase: CatalogPhase::Error,
+            app_count: 3,
+            file_count: 12,
+            updated_at_ms: Some(1_700),
+            message: Some("scan failed".to_owned()),
+        };
+        let value = serde_json::to_value(status).expect("catalog status should serialize");
+
+        assert_eq!(value["phase"], "error");
+        assert_eq!(value["app_count"], 3);
+        assert_eq!(value["file_count"], 12);
+        assert_eq!(value["message"], "scan failed");
     }
 
     #[test]
